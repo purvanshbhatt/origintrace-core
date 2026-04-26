@@ -1,86 +1,32 @@
-# 🔬 OriginTrace
+# OriginTrace
 
-**AI-Powered Malware Provenance & Supply Chain Attribution Engine**
+**Autonomous Semantic Provenance (ASP)**
 
-OriginTrace is a lightweight malware analysis tool that combines deterministic local PE extraction with LLM-powered intelligence to produce:
-- MITRE ATT&CK technique mapping with evidence
-- Semantic Provenance Analysis (supply chain hijack detection)
-- Production-grade YARA rules (static detection)
-- Sigma rules (behavioral detection)
+## The Narrative
+OriginTrace is the technical forensic engine under the ResilAI ecosystem. While ResilAI handles high-level risk and governance, OriginTrace is the "hard-hat" tool that identifies malicious code-level discrepancies (deltas) in hijacked libraries.
 
-## Architecture
+## The Supply Chain Pivot
+Traditional security relies on reactive detection—flagging a threat only after it has executed or matched a known signature. OriginTrace shifts the paradigm from **reactive detection** to **autonomous attribution**. We dissect software supply chain components at a fundamental level, automatically identifying where malicious modifications were introduced, prioritizing the source and lineage of the code block before it deploys.
 
-```
-┌─────────────────────┐     ┌──────────────────────────┐
-│  PE Extractor       │     │  Master Intelligence     │
-│  (Local / Free)     │────▶│  Agent (Gemini 2.0)      │
-│                     │     │                          │
-│  • SHA256/MD5/ImpH  │     │  • MITRE ATT&CK Mapping  │
-│  • API Imports      │     │  • Supply Chain Analysis  │
-│  • String Analysis  │     │  • YARA/Sigma Generation  │
-└─────────────────────┘     └──────────────────────────┘
-```
+## Autonomous Semantic Provenance (ASP)
+We are defining a new category of cybersecurity: **Autonomous Semantic Provenance (ASP)**.
+ASP goes beyond static and dynamic analysis. It understands the *meaning* (semantics) of code changes and autonomously traces the *origin* (provenance) of those changes. By analyzing behavioral features, AST deltas, and cross-referencing global threat intelligence, OriginTrace maps behaviors to MITRE ATT&CK techniques and isolates hijacked elements from native code with unprecedented accuracy.
 
-## Quick Start
+## Competitive Advantage
+OriginTrace is built for the modern threat landscape, offering distinct advantages over traditional tools:
 
-### 1. Install Dependencies
-```bash
-pip install -r requirements.txt
-```
+* **vs. Ghidra**: **Speed.** Manual reverse engineering in Ghidra can take days or weeks for a skilled analyst. OriginTrace automates this workflow, delivering deep code analysis and behavioral parsing in a fraction of the time.
+* **vs. CAPA**: **Provenance Context.** While CAPA is excellent for identifying capabilities, it lacks historical and contextual awareness. OriginTrace provides the full provenance—not just *what* the code does, but *where* it came from and *how* it was altered.
+* **vs. VirusTotal (VT)**: **The "Why".** VT tells you *if* a file is bad based on community consensus and antivirus engines. OriginTrace tells you *why* it's bad, providing the underlying semantic reasoning, the specific malicious deltas, and the precise context needed to write robust detection engineering rules.
 
-### 2. Set API Key
-```powershell
-# Windows
-$env:GEMINI_API_KEY = "your_key_here"
-```
-```bash
-# Linux/Mac
-export GEMINI_API_KEY="your_key_here"
-```
+## Ecosystem Architecture: OriginTrace vs. ResilAI
+To prevent brand confusion, it is critical to understand the distinction between our core offerings:
 
-### 3. Analyze a PE Binary
-```bash
-python main.py <path_to_sample.exe>
-```
+* **OriginTrace**: The **Technical Engine**. The hard-hat forensic tool for SOC analysts and detection engineers. It performs the deep code-level analysis, binary inspection, and logic tracing.
+* **ResilAI**: The **Governance Layer**. The executive dashboard for CISOs and risk managers. It consumes intelligence from OriginTrace to quantify business risk, ensure compliance, and orchestrate automated policy enforcement.
 
-### Example Output
-```json
-{
-  "summary": {
-    "behavior": "Credential harvesting trojan with C2 callback capability",
-    "threat_level": "High"
-  },
-  "mitre_mapping": [
-    {
-      "technique_id": "T1003",
-      "technique_name": "OS Credential Dumping",
-      "evidence": "Imports: advapi32.dll:LsaRetrievePrivateData, crypt32.dll:CryptUnprotectData"
-    }
-  ],
-  "attribution": {
-    "origin": "pip",
-    "suspected_package": "requests-toolkit"
-  },
-  "detections": {
-    "yara_rule": "rule OriginTrace_CredHarvester { ... }",
-    "sigma_rule": "title: Suspicious Credential Access via CryptUnprotectData ..."
-  }
-}
-```
+## Brand Guidelines
+When building community-contributed rules, custom integrations, or extending the Investigation Workbench, please adhere to our core color palette:
 
-## Project Structure
-```
-origintrace-core/
-├── main.py                    # CLI orchestrator
-├── requirements.txt           # Python dependencies
-├── extractors/
-│   ├── __init__.py
-│   └── pe_extractor.py        # Deterministic PE feature extraction
-└── agents/
-    ├── __init__.py
-    └── intelligence.py        # Gemini LLM analysis agent
-```
-
-## License
-
-MIT
+* **Resilience Cyan**: Represents verified, safe provenance, trusted libraries, clean code paths, and optimal system health.
+* **Infection Crimson**: Represents malicious deltas, hijacked behaviors, identified threats, and compromised dependencies.

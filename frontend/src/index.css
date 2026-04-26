@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-background text-text-primary antialiased font-sans overflow-hidden;
+  }
+}
+
+@layer utilities {
+  .bg-grid-pattern {
+    background-size: 24px 24px;
+    background-image: var(--tw-gradient-stops);
+  }
+  
+  /* Custom scrollbar for deep dark environments */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-surface;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border rounded hover:bg-slate-500 transition-colors;
+  }
+
+  .pane-header {
+    @apply flex items-center justify-between px-3 py-2 bg-surface border-b border-border text-xs font-semibold tracking-wider text-text-secondary uppercase select-none;
+  }
+}
