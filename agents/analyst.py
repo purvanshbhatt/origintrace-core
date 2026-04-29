@@ -21,7 +21,7 @@ class AnalystReport(BaseModel):
 class ThreatAnalystAgent:
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
-        self.model_id = 'gemini-2.0-flash'
+        self.model_id = 'gemini-3-flash-preview'
         
         self.system_prompt = """You are the OriginTrace Threat Analyst. 
 You are receiving a `MalwareContext` containing static PE features, r2pipe entrypoint disassembly, and deterministic FAISS vector search results (Provenance). 
@@ -39,8 +39,7 @@ Your job is to translate these raw features into a strategic MITRE ATT&CK report
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=AnalystReport,
-                temperature=0.1
+                response_schema=AnalystReport
             )
         )
         

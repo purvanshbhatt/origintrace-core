@@ -10,7 +10,7 @@ class DetectionArtifacts(BaseModel):
 class DetectionEngineerAgent:
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
-        self.model_id = "gemini-2.0-flash"
+        self.model_id = "gemini-3-flash-preview"
 
     def _get_system_prompt(self) -> str:
         return """
@@ -44,7 +44,6 @@ Provide raw, valid YARA syntax and raw, valid Sigma YAML syntax.
             system_instruction=self._get_system_prompt(),
             response_mime_type="application/json",
             response_schema=DetectionArtifacts,
-            temperature=0.0,
         )
 
         # google-genai structured generation natively supports async calls

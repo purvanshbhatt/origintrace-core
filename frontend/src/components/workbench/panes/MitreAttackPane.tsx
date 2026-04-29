@@ -11,7 +11,7 @@ interface AttackTechnique {
   confidence: 'High' | 'Medium' | 'Low';
 }
 
-const mtcData: AttackTechnique[] = [
+const FALLBACK_DATA: AttackTechnique[] = [
   { id: 'T1059', name: 'Command and Scripting Interpreter', tactic: 'Execution', evidence: 'Cmd.exe spawned with suspicious encoded Base64 parameters.', confidence: 'High' },
   { id: 'T1055', name: 'Process Injection', tactic: 'Privilege Escalation', evidence: 'CreateRemoteThread discovered targeting lsass.exe', confidence: 'High' },
   { id: 'T1082', name: 'System Information Discovery', tactic: 'Discovery', evidence: 'Registry queries to HKLM\\Software\\Microsoft\\Cryptography', confidence: 'Medium' },
@@ -22,7 +22,21 @@ const mtcData: AttackTechnique[] = [
 ];
 
 export function MitreAttackPane() {
-  const { selectedGraphNodeId } = useInvestigationStore();
+  const { selectedGraphNodeId, finalReport } = useInvestigationStore();
+
+  // Wire to live data from the store; fall back to mock data when no report is available
+  const mtcData: AttackTechnique[] = useMemo(() => {
+    const liveMapping = finalReport?.intelligence?.mitre_mapping;
+    if (!liveMapping || liveMapping.length === 0) return FALLBACK_DATA;
+    
+    return liveMapping.map((ttp: any) => ({
+      id: ttp.technique_id || ttp.id || 'N/A',
+      name: ttp.technique_id || 'Unknown Technique',
+      tactic: ttp.tactic || 'Unknown',
+      evidence: ttp.evidence || ttp.ai_evidence || '-',
+      confidence: inferConfidence(ttp.evidence || ttp.ai_evidence || ''),
+    }));
+  }, [finalReport]);
 
   const getConfidenceColor = (conf: string) => {
     switch(conf) {
@@ -39,7 +53,7 @@ export function MitreAttackPane() {
       acc[curr.tactic].push(curr);
       return acc;
     }, {} as Record<string, AttackTechnique[]>);
-  }, []);
+  }, [mtcData]);
 
   const highlightedTactic = selectedGraphNodeId === '3' ? 'Defense Evasion' : null;
 
@@ -101,4 +115,13 @@ export function MitreAttackPane() {
       </div>
     </div>
   );
+}
+
+/** Infer confidence from the specificity of the evidence string */
+function inferConfidence(evidence: string): 'High' | 'Medium' | 'Low' {
+  if (!evidence || evidence === '-') return 'Low';
+  // If the evidence contains a specific function name, address, or quoted string, it's high-confidence
+  if (/0x[0-9a-fA-F]+|".*?"|'.+?'|[A-Z][a-z]+[A-Z]|\.dll|\.exe/.test(evidence)) return 'High';
+  if (evidence.length > 30) return 'Medium';
+  return 'Low';
 }

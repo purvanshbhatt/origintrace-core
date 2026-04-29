@@ -2,8 +2,9 @@ import React, { useState } from 'react';
 import { Terminal, Copy, DownloadCloud, CheckCircle2 } from 'lucide-react';
 import { cn } from '../../../lib/utils';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useInvestigationStore } from '../../../store/useInvestigationStore';
 
-const YARA_RULE = `rule origintrace_supply_chain_implant : Suspicious
+const FALLBACK_YARA = `rule origintrace_supply_chain_implant : Suspicious
 {
     meta:
         description = "Detects dynamic resolution and injection via suspect imported library"
@@ -26,7 +27,7 @@ const YARA_RULE = `rule origintrace_supply_chain_implant : Suspicious
         math.entropy(0, filesize) >= 7.5
 }`;
 
-const SIGMA_RULE = `title: Suspicious Process Injection via Supply Chain Implant
+const FALLBACK_SIGMA = `title: Suspicious Process Injection via Supply Chain Implant
 id: a1b2c3d4-e5f6-7890-1234-567890abcdef
 status: experimental
 description: Detects process injection behaviors originating from a known hijacked library path.
@@ -51,9 +52,16 @@ tags:
 export function DetectionEngineeringPane() {
   const [activeTab, setActiveTab] = useState<'yara' | 'sigma'>('yara');
   const [copied, setCopied] = useState(false);
+  const { finalReport } = useInvestigationStore();
+
+  // Wire to live data from the store; fall back to hardcoded constants when no report is available
+  const yaraRule = finalReport?.detections?.yara_rule || FALLBACK_YARA;
+  const sigmaRule = finalReport?.detections?.sigma_rule || FALLBACK_SIGMA;
+
+  const activeContent = activeTab === 'yara' ? yaraRule : sigmaRule;
 
   const handleCopy = () => {
-    // navigator.clipboard.writeText(...)
+    navigator.clipboard.writeText(activeContent).catch(() => {});
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -106,7 +114,7 @@ export function DetectionEngineeringPane() {
         <pre className="font-mono text-sm leading-relaxed text-text-primary/90">
           <code className="block whitespace-pre-wrap selection:bg-neon-cyan/30 selection:text-white">
             {activeTab === 'yara' && (
-              <span dangerouslySetInnerHTML={{ __html: YARA_RULE
+              <span dangerouslySetInnerHTML={{ __html: yaraRule
                 .replace(/(rule|meta:|strings:|condition:|and|all of|filesize|\$s1|\$hex1|\$api1|\$api2)/g, '<span class="text-neon-purple font-bold">$1</span>')
                 .replace(/(".*?")/g, '<span class="text-neon-yellow">$1</span>')
                 .replace(/(0x[0-9a-fA-F]+|\d+)/g, '<span class="text-neon-cyan">$1</span>') 
@@ -114,7 +122,7 @@ export function DetectionEngineeringPane() {
             )}
             
             {activeTab === 'sigma' && (
-              <span dangerouslySetInnerHTML={{ __html: SIGMA_RULE
+              <span dangerouslySetInnerHTML={{ __html: sigmaRule
                 .replace(/(title:|id:|status:|description:|author:|date:|logsource:|category:|product:|detection:|selection:|condition:|level:|tags:)/g, '<span class="text-neon-purple font-bold">$1</span>')
                 .replace(/('.*?')/g, '<span class="text-neon-yellow">$1</span>')
               }} />

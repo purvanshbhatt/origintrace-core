@@ -32,7 +32,7 @@ if USE_MOCK:
     analyst_service = ThreatAnalystAgent()
     detection_service = DetectionEngineerAgent()
 else:
-    print("[*] Running in PRODUCTION MODE with Gemini 2.0 Flash")
+    print("[*] Running in PRODUCTION MODE with Gemini 3.0 Flash Preview")
     from extractors.extractor import MasterBinaryExtractor
     from agents.analyst import ThreatAnalystAgent
     from agents.detection_engineer import DetectionEngineerAgent
