@@ -46,7 +46,7 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
     if (attribution) {
       const supplyId = 'supply_chain';
       const label = attribution.suspected_package 
-        ? \`\${attribution.ecosystem}: \${attribution.suspected_package}\` 
+        ? `${attribution.ecosystem}: ${attribution.suspected_package}` 
         : attribution.ecosystem || 'Unknown Ecosystem';
       
       nodes.push({
@@ -67,8 +67,8 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
     // 3. MITRE TTPs and Evidence Nodes
     const mitre = report.intelligence.mitre_mapping || [];
     mitre.forEach((ttp: any, index: number) => {
-      const ttpId = \`ttp_\${index}\`;
-      const ttpLabel = ttp.technique_id ? \`\${ttp.technique_id}: \${ttp.tactic}\` : ttp.tactic;
+      const ttpId = `ttp_${index}`;
+      const ttpLabel = ttp.technique_id ? `${ttp.technique_id}: ${ttp.tactic}` : ttp.tactic;
       
       nodes.push({
         id: ttpId,
@@ -85,7 +85,7 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
       });
 
       if (ttp.evidence) {
-        const evidenceId = \`evidence_\${index}\`;
+        const evidenceId = `evidence_${index}`;
         nodes.push({
           id: evidenceId,
           name: ttp.evidence,
@@ -146,7 +146,7 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
           // Label
           const label = node.name;
           const fontSize = 12 / globalScale;
-          ctx.font = \`\${fontSize}px "Fira Code", monospace\`;
+          ctx.font = `${fontSize}px "Fira Code", monospace`;
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';

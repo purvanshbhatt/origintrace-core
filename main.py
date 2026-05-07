@@ -49,6 +49,10 @@ else:
     analyst_service = ThreatAnalystAgent(api_key=api_key)
     detection_service = DetectionEngineerAgent(api_key=api_key)
 
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "OriginTrace API is running. Send POST requests to /api/v1/analyze."}
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "origintrace-engine-backend"}
