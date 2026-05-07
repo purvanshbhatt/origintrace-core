@@ -18,9 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2. Build and install Radare2 from source + r2ghidra plugin
 RUN git clone --depth 1 https://github.com/radareorg/radare2.git \
     && cd radare2 \
-    && ./sys/install.sh \
-    && r2pm -U \
-    && r2pm -gi r2ghidra
+    && ./sys/install.sh
 
 # 3. Setup Python Application
 WORKDIR /app
@@ -34,6 +32,9 @@ COPY . .
 # 4. Non-root execution for security
 RUN useradd -m appuser && chown -R appuser /app
 USER appuser
+
+# 5. Install r2ghidra locally for appuser (avoids sudo)
+RUN r2pm -U && r2pm -i r2ghidra
 
 EXPOSE 8080
 
