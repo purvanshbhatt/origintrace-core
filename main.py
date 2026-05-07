@@ -14,9 +14,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:8080").split(",")
+
+origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://origintrace-ui.web.app",
+    "https://origintrace-ui.firebaseapp.com"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
