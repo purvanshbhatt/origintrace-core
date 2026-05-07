@@ -94,6 +94,14 @@ class MasterBinaryExtractor:
 
         try:
             r2 = r2pipe.open(file_path)
+            
+            # Prevent r2ghidra from hanging on text/unstructured files
+            info = r2.cmdj("iIj")
+            if info and info.get("bintype", "any") == "any":
+                r2.quit()
+                result["status"] = f"{result['status']} | Warning: Not a structured binary, skipping deep decompilation"
+                return result
+
             r2.cmd("aa")  # Basic analysis (faster than aaa)
 
             # String Filtering via Regex (Kill the Noise)
