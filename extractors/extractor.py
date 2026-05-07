@@ -24,7 +24,7 @@ class MasterBinaryExtractor:
     def __init__(self):
         self.provenance_engine = ProvenanceEngine()
 
-    async def extract_all(self, file_path: str, filename: str) -> Dict[str, Any]:
+    def extract_all(self, file_path: str, filename: str) -> Dict[str, Any]:
         """
         Unified extractor pipeline. Gracefully falls back on errors to provide maximum available data
         to the Intelligence Agent.

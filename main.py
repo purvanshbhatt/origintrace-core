@@ -74,7 +74,7 @@ async def analyze_binary(file: UploadFile = File(...)):
                 with os.fdopen(temp_fd, 'wb') as f:
                     while chunk := await file.read(8 * 1024 * 1024):
                         f.write(chunk)
-                features = await extractor_service.extract_all(file_path=temp_path, filename=file.filename)
+                features = await asyncio.to_thread(extractor_service.extract_all, file_path=temp_path, filename=file.filename)
             
             # Step 2: Analyst
             yield f'data: {json.dumps({"type": "status", "agent": "Analyst", "message": "Mapping behaviors to MITRE ATT&CK..."})}\n\n'

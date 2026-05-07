@@ -24,7 +24,7 @@ import signal
 import angr
 import claripy
 from typing import List, Optional
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 logger = logging.getLogger("origintrace.symbolic")
 
@@ -230,7 +230,7 @@ def resolve_with_timeout(binary_path: str, start_addr: int,
         List of resolved strings, or empty list on timeout/error.
     """
     try:
-        with ProcessPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_run_engine, binary_path, start_addr, end_addr)
             return future.result(timeout=timeout)
     except FuturesTimeout:
