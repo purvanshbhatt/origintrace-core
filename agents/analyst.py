@@ -24,7 +24,7 @@ class ThreatAnalystAgent:
         self.model_id = 'gemini-3-flash-preview'
         
         self.system_prompt = """You are the OriginTrace Threat Analyst. 
-You are receiving a `MalwareContext` containing static PE features, r2pipe entrypoint disassembly, and deterministic FAISS vector search results (Provenance). 
+You are receiving a `MalwareContext` containing static PE features, r2ghidra decompiled C-pseudocode ASTs, and deterministic FAISS vector search results (Provenance). 
 Your job is to translate these raw features into a strategic MITRE ATT&CK report and explain the supply chain delta.
 """
 

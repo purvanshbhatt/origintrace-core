@@ -14,9 +14,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:8080").split(",")
+
+origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://origintrace-ui.web.app",
+    "https://origintrace-ui.firebaseapp.com"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,6 +49,10 @@ else:
     analyst_service = ThreatAnalystAgent(api_key=api_key)
     detection_service = DetectionEngineerAgent(api_key=api_key)
 
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "OriginTrace API is running. Send POST requests to /api/v1/analyze."}
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "origintrace-engine-backend"}
@@ -50,7 +63,7 @@ async def analyze_binary(file: UploadFile = File(...)):
         temp_path = None
         try:
             # Step 1: Extraction
-            yield f'data: {json.dumps({"type": "status", "agent": "Extractor", "message": "Unpacking PE headers..."})}\n\n'
+            yield f'data: {json.dumps({"type": "status", "agent": "Extractor", "message": "Identifying file type and extracting features..."})}\n\n'
             await asyncio.sleep(0.5)
             
             if USE_MOCK:
@@ -61,7 +74,11 @@ async def analyze_binary(file: UploadFile = File(...)):
                 with os.fdopen(temp_fd, 'wb') as f:
                     while chunk := await file.read(8 * 1024 * 1024):
                         f.write(chunk)
-                features = await extractor_service.extract_all(file_path=temp_path, filename=file.filename)
+                # Wrap in wait_for to prevent infinite hangs on invalid binaries
+                features = await asyncio.wait_for(
+                    asyncio.to_thread(extractor_service.extract_all, file_path=temp_path, filename=file.filename),
+                    timeout=45.0
+                )
             
             # Step 2: Analyst
             yield f'data: {json.dumps({"type": "status", "agent": "Analyst", "message": "Mapping behaviors to MITRE ATT&CK..."})}\n\n'

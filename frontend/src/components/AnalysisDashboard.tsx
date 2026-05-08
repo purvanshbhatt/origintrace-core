@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { UploadCloud, FileCode, ShieldAlert, Cpu, CheckCircle2, Copy, AlertCircle, ShieldBan, Terminal } from 'lucide-react';
+import { UploadCloud, FileCode, ShieldAlert, Cpu, CheckCircle2, Copy, AlertCircle, ShieldBan, Terminal, Network } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { ThreatGraph } from './ThreatGraph';
 
 // --- Type Definitions for the Dashboard State ---
 type AnalysisState = 'idle' | 'analyzing' | 'complete' | 'error';
@@ -31,8 +32,8 @@ export function AnalysisDashboard() {
   // Drag state
   const [isDragging, setIsDragging] = useState(false);
   
-  // Code Viewer Tab
-  const [activeTab, setActiveTab] = useState<'yara' | 'sigma'>('yara');
+  // Code Viewer / Graph Tab
+  const [activeTab, setActiveTab] = useState<'yara' | 'sigma' | 'graph'>('graph');
   const [copied, setCopied] = useState(false);
 
   // Auto-scroll terminal
@@ -54,7 +55,8 @@ export function AnalysisDashboard() {
     formData.append('file', file);
 
     try {
-      const response = await fetch('http://localhost:8080/api/v1/analyze', {
+      const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
+      const response = await fetch(`${API_BASE}/api/v1/analyze`, {
         method: 'POST',
         body: formData,
       });
@@ -301,6 +303,13 @@ export function AnalysisDashboard() {
                     >
                       Sigma Rule
                     </button>
+                    <button 
+                      onClick={() => setActiveTab('graph')}
+                      className={`px-6 py-3 text-xs font-bold tracking-widest uppercase transition-colors ${activeTab === 'graph' ? 'text-cyan-400 border-b-2 border-cyan-400' : 'text-gray-500 hover:text-gray-300'} flex items-center`}
+                    >
+                      <Network className="w-4 h-4 mr-2" />
+                      Threat Graph
+                    </button>
                     <div className="ml-auto flex items-center pr-4">
                       <button 
                         onClick={() => handleCopy(activeTab === 'yara' ? report.detections.yara_rule : report.detections.sigma_rule)}
@@ -312,12 +321,18 @@ export function AnalysisDashboard() {
                     </div>
                   </div>
                   
-                  <div className="flex-1 bg-black p-6 overflow-auto custom-scrollbar">
-                    <pre className="font-mono text-[13px] leading-relaxed text-gray-300 whitespace-pre-wrap">
-                      <code>
-                        {activeTab === 'yara' ? report.detections.yara_rule : report.detections.sigma_rule}
-                      </code>
-                    </pre>
+                  <div className="flex-1 bg-black overflow-hidden relative">
+                    {activeTab === 'graph' ? (
+                      <ThreatGraph report={report} />
+                    ) : (
+                      <div className="p-6 h-full overflow-auto custom-scrollbar">
+                        <pre className="font-mono text-[13px] leading-relaxed text-gray-300 whitespace-pre-wrap">
+                          <code>
+                            {activeTab === 'yara' ? report.detections.yara_rule : report.detections.sigma_rule}
+                          </code>
+                        </pre>
+                      </div>
+                    )}
                   </div>
                 </div>
 

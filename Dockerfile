@@ -1,48 +1,45 @@
-# Use the official lightweight Python 3.11 image
+# ============================================================
+# OriginTrace Engine — Production Dockerfile
+# Universal Malware Analysis: PE + ELF + Scripts + Office Macros
+# Semantic Lifting via r2ghidra + Concolic Execution via angr
+# ============================================================
 FROM python:3.11-slim
 
-# Set strict environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
 
-# 1. Install system dependencies
-# Specifically require git, gcc, and make to compile radare2 locally
+# 1. Install ALL system dependencies in a single layer.
+#    patch + pkg-config are required by radare2's configure script.
+#    g++ + cmake are required to compile the r2ghidra plugin.
+#    libmagic1 is the C library backing python-magic for MIME detection.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    git \
-    make \
-    gcc \
-    libc6-dev \
+    wget git make gcc g++ cmake pkg-config patch libc6-dev \
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Build and install Radare2 from source
-# r2pipe requires the underlying radare2 binaries on the host OS
+# 2. Build and install Radare2 from source + r2ghidra plugin
 RUN git clone --depth 1 https://github.com/radareorg/radare2.git \
     && cd radare2 \
-    && sys/install.sh \
-    && cd .. \
-    && rm -rf radare2
+    && ./sys/install.sh
 
 # 3. Setup Python Application
 WORKDIR /app
 
-# Copy requirements strictly to cache the pip install layer
 COPY requirements.txt .
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Ensure pip is upgraded and install Python deps (pefile, r2pipe, google-genai, fastapi)
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Copy the rest of the application code
 COPY . .
 
-# Run the app under an unprivileged user for security
+# 4. Non-root execution for security
 RUN useradd -m appuser && chown -R appuser /app
 USER appuser
 
-# Expose the Cloud Run port
+# 5. Install r2ghidra locally for appuser (avoids sudo)
+RUN r2pm -U && r2pm -i r2ghidra
+
 EXPOSE 8080
 
-# Run Uvicorn via execution form
-CMD ["sh", "-c", "uvicorn mock_api.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# 6. Run the production FastAPI server
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
