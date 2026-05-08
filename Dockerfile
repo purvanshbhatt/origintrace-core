@@ -1,5 +1,6 @@
 # ============================================================
 # OriginTrace Engine — Production Dockerfile
+# Universal Malware Analysis: PE + ELF + Scripts + Office Macros
 # Semantic Lifting via r2ghidra + Concolic Execution via angr
 # ============================================================
 FROM python:3.11-slim
@@ -11,8 +12,10 @@ ENV PORT=8080
 # 1. Install ALL system dependencies in a single layer.
 #    patch + pkg-config are required by radare2's configure script.
 #    g++ + cmake are required to compile the r2ghidra plugin.
+#    libmagic1 is the C library backing python-magic for MIME detection.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget git make gcc g++ cmake pkg-config patch libc6-dev \
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Build and install Radare2 from source + r2ghidra plugin
@@ -38,5 +41,5 @@ RUN r2pm -U && r2pm -i r2ghidra
 
 EXPOSE 8080
 
-# 5. Run the production FastAPI server
+# 6. Run the production FastAPI server
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

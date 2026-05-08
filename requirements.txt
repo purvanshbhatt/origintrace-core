@@ -9,3 +9,6 @@ faiss-cpu==1.8.0
 sentence-transformers==3.0.1
 numpy==1.26.4
 angr==9.2.125
+python-magic==0.4.27
+pyelftools==0.31
+oletools==0.60.2

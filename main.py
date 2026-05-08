@@ -63,7 +63,7 @@ async def analyze_binary(file: UploadFile = File(...)):
         temp_path = None
         try:
             # Step 1: Extraction
-            yield f'data: {json.dumps({"type": "status", "agent": "Extractor", "message": "Unpacking PE headers..."})}\n\n'
+            yield f'data: {json.dumps({"type": "status", "agent": "Extractor", "message": "Identifying file type and extracting features..."})}\n\n'
             await asyncio.sleep(0.5)
             
             if USE_MOCK:
