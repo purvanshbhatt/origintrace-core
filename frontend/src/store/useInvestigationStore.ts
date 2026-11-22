@@ -1,5 +1,7 @@
 import { create } from 'zustand';
+import type { FinalReport } from '../types/report';
 
+export type AnalysisState = 'idle' | 'analyzing' | 'complete' | 'error';
 export type AgentStepStatus = 'pending' | 'loading' | 'success' | 'error';
 
 export interface AgentStep {
@@ -11,57 +13,106 @@ export interface AgentStep {
 }
 
 interface InvestigationState {
-  // Session metadata
-  analysisState: 'idle' | 'analyzing' | 'complete' | 'error';
-  finalReport: any | null;
-  fileHash: string;
-  setFileHash: (hash: string) => void;
-  fileSize: string;
-  threatScore: number;
+  // Session
+  analysisState: AnalysisState;
+  finalReport: FinalReport | null;
+  fileName: string | null;
+  fileSize: number | null;
   liveStatus: string;
-  setLiveStatus: (status: string) => void;
-  setFinalReport: (report: any) => void;
-  
-  // Selected contexts for cross-pane interaction
-  selectedGraphNodeId: string | null;
-  setSelectedGraphNodeId: (id: string | null) => void;
+  errorMessage: string | null;
 
   // Agent Timeline
   agentSteps: AgentStep[];
-  updateAgentStep: (id: string, status: AgentStepStatus, details?: string) => void;
-  
+
+  // Indicator selected in the attribution graph, used to cross-highlight panes
+  selectedIndicator: string | null;
+  setSelectedIndicator: (indicator: string | null) => void;
+
   // App-wide command palette toggle
   isCommandPaletteOpen: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
+
+  // Analysis lifecycle
+  startAnalysis: (fileName: string, fileSize: number) => void;
+  addStatus: (agent: string, message: string) => void;
+  completeAnalysis: (report: FinalReport) => void;
+  failAnalysis: (message: string) => void;
+  reset: () => void;
 }
 
-export const useInvestigationStore = create<InvestigationState>((set) => ({
-  analysisState: 'idle',
-  finalReport: null,
-  fileHash: 'SHA256: 8f434346648f6b96e448b111...722f',
-  setFileHash: (hash) => set({ fileHash: hash }),
-  fileSize: '4.2 MB',
-  threatScore: 88,
-  liveStatus: 'Analysis Agent: Mapping TTPs...',
-  setLiveStatus: (status) => set({ liveStatus: status }),
-  setFinalReport: (report) => set({ finalReport: report }),
-  
-  selectedGraphNodeId: null,
-  setSelectedGraphNodeId: (id) => set({ selectedGraphNodeId: id }),
+const IDLE_STATUS = 'Awaiting artifact';
 
-  agentSteps: [
-    { id: '1', name: 'Extraction Agent: Initialized', status: 'success', timestamp: '14:02:10' },
-    { id: '2', name: 'File Parsing & Entropy Check', status: 'success', timestamp: '14:02:12' },
-    { id: '3', name: 'Analysis Agent: Streaming...', status: 'loading', details: 'Scanning for known malicious signatures' },
-    { id: '4', name: 'Attribution Agent: Pending', status: 'pending' },
-    { id: '5', name: 'Detection Engineering: Pending', status: 'pending' },
-  ],
-  updateAgentStep: (id, status, details) => set((state) => ({
-    agentSteps: state.agentSteps.map(step => 
-      step.id === id ? { ...step, status, details } : step
-    )
-  })),
+const initialSession = {
+  analysisState: 'idle' as AnalysisState,
+  finalReport: null,
+  fileName: null,
+  fileSize: null,
+  liveStatus: IDLE_STATUS,
+  errorMessage: null,
+  agentSteps: [] as AgentStep[],
+  selectedIndicator: null,
+};
+
+const settle = (steps: AgentStep[], status: AgentStepStatus): AgentStep[] =>
+  steps.map((step) => (step.status === 'loading' ? { ...step, status } : step));
+
+export const useInvestigationStore = create<InvestigationState>((set) => ({
+  ...initialSession,
+
+  setSelectedIndicator: (indicator) => set({ selectedIndicator: indicator }),
 
   isCommandPaletteOpen: false,
   setCommandPaletteOpen: (open) => set({ isCommandPaletteOpen: open }),
+
+  startAnalysis: (fileName, fileSize) => set({
+    ...initialSession,
+    analysisState: 'analyzing',
+    fileName,
+    fileSize,
+    liveStatus: 'Uploading artifact...',
+  }),
+
+  addStatus: (agent, message) => set((state) => {
+    const steps = state.agentSteps;
+    const last = steps[steps.length - 1];
+    const liveStatus = `${agent}: ${message}`;
+
+    // Consecutive updates from one agent refine its step instead of adding rows.
+    if (last && last.name === agent && last.status === 'loading') {
+      return {
+        liveStatus,
+        agentSteps: [...steps.slice(0, -1), { ...last, details: message }],
+      };
+    }
+    return {
+      liveStatus,
+      agentSteps: [
+        ...settle(steps, 'success'),
+        {
+          id: `step-${steps.length + 1}`,
+          name: agent,
+          details: message,
+          status: 'loading',
+          timestamp: new Date().toLocaleTimeString(),
+        },
+      ],
+    };
+  }),
+
+  completeAnalysis: (report) => set((state) => ({
+    analysisState: 'complete',
+    finalReport: report,
+    liveStatus: 'Analysis complete',
+    errorMessage: null,
+    agentSteps: settle(state.agentSteps, 'success'),
+  })),
+
+  failAnalysis: (message) => set((state) => ({
+    analysisState: 'error',
+    liveStatus: 'Analysis failed',
+    errorMessage: message,
+    agentSteps: settle(state.agentSteps, 'error'),
+  })),
+
+  reset: () => set({ ...initialSession }),
 }));

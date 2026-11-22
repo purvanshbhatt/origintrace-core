@@ -4,7 +4,9 @@
 
 @layer base {
   body {
-    @apply bg-background text-text-primary antialiased font-sans overflow-hidden;
+    /* No overflow-hidden here: the landing and docs pages must scroll.
+       The workbench clips itself with h-screen + overflow-hidden. */
+    @apply bg-background text-text-primary antialiased font-sans;
   }
 }
 
@@ -29,4 +31,17 @@
   .pane-header {
     @apply flex items-center justify-between px-3 py-2 bg-surface border-b border-border text-xs font-semibold tracking-wider text-text-secondary uppercase select-none;
   }
+}
+
+/* reactflow ships light-theme controls; match the dark workbench.
+   Kept outside @layer: Tailwind purges layered rules whose class names do not
+   appear in our source, and these classes only exist inside the library.
+   The extra .react-flow ancestor outranks the library stylesheet. */
+.react-flow .react-flow__controls-button {
+  background-color: #0f172a;
+  border-bottom-color: #334155;
+  fill: #cbd5e1;
+}
+.react-flow .react-flow__controls-button:hover {
+  background-color: #1e293b;
 }

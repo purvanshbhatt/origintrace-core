@@ -1,12 +1,32 @@
-import React, { useMemo, useRef, useEffect, useState } from 'react';
+import { useMemo, useRef, useEffect, useState } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
+import type { ForceGraphMethods, LinkObject, NodeObject } from 'react-force-graph-2d';
+import type { FinalReport } from '../types/report';
+import { truncateEnd } from '../lib/format';
 
 interface ThreatGraphProps {
-  report: any;
+  report: FinalReport;
 }
 
+interface GraphNodeData {
+  id: string;
+  name: string;
+  group: 'root' | 'supply' | 'ttp' | 'evidence';
+  color: string;
+  val: number;
+}
+
+interface GraphLinkData {
+  color: string;
+}
+
+type GraphNode = NodeObject<GraphNodeData>;
+type GraphLink = LinkObject<GraphNodeData, GraphLinkData>;
+
+const MAX_LABEL_CHARS = 60;
+
 export function ThreatGraph({ report }: ThreatGraphProps) {
-  const fgRef = useRef<any>();
+  const fgRef = useRef<ForceGraphMethods<GraphNode, GraphLink> | undefined>(undefined);
   const [dimensions, setDimensions] = useState({ width: 800, height: 400 });
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -26,16 +46,14 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
   }, []);
 
   const graphData = useMemo(() => {
-    if (!report || !report.intelligence) return { nodes: [], links: [] };
-
-    const nodes: any[] = [];
-    const links: any[] = [];
+    const nodes: GraphNode[] = [];
+    const links: GraphLink[] = [];
 
     // 1. Root Node (The analyzed binary)
     const rootId = 'root';
     nodes.push({
       id: rootId,
-      name: 'Analyzed Artifact',
+      name: truncateEnd(report.features.metadata.filename || 'Analyzed Artifact', MAX_LABEL_CHARS),
       group: 'root',
       color: '#00f0ff', // Neon Cyan
       val: 20
@@ -43,12 +61,12 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
 
     // 2. Supply Chain Node
     const attribution = report.intelligence.attribution;
-    if (attribution) {
+    if (attribution && (attribution.suspected_package || attribution.ecosystem !== 'Unknown')) {
       const supplyId = 'supply_chain';
-      const label = attribution.suspected_package 
-        ? `${attribution.ecosystem}: ${attribution.suspected_package}` 
-        : attribution.ecosystem || 'Unknown Ecosystem';
-      
+      const label = attribution.suspected_package
+        ? `${attribution.ecosystem}: ${attribution.suspected_package}`
+        : attribution.ecosystem;
+
       nodes.push({
         id: supplyId,
         name: label,
@@ -56,7 +74,7 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
         color: '#b142f5', // Purple
         val: 15
       });
-      
+
       links.push({
         source: supplyId,
         target: rootId,
@@ -66,10 +84,10 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
 
     // 3. MITRE TTPs and Evidence Nodes
     const mitre = report.intelligence.mitre_mapping || [];
-    mitre.forEach((ttp: any, index: number) => {
+    mitre.forEach((ttp, index) => {
       const ttpId = `ttp_${index}`;
-      const ttpLabel = ttp.technique_id ? `${ttp.technique_id}: ${ttp.tactic}` : ttp.tactic;
-      
+      const ttpLabel = ttp.technique_id ? `${ttp.technique_id}: ${ttp.technique_name || ttp.tactic}` : ttp.tactic;
+
       nodes.push({
         id: ttpId,
         name: ttpLabel,
@@ -88,7 +106,7 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
         const evidenceId = `evidence_${index}`;
         nodes.push({
           id: evidenceId,
-          name: ttp.evidence,
+          name: truncateEnd(ttp.evidence, MAX_LABEL_CHARS),
           group: 'evidence',
           color: '#fbbf24', // Muted Yellow
           val: 8
@@ -114,7 +132,7 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
           Provenance Knowledge Graph
         </h3>
       </div>
-      
+
       <div className="absolute bottom-4 right-4 z-10 pointer-events-none text-[10px] text-gray-500 font-mono text-right">
         <div>Nodes: {graphData.nodes.length}</div>
         <div>Edges: {graphData.links.length}</div>
@@ -132,26 +150,28 @@ export function ThreatGraph({ report }: ThreatGraphProps) {
         linkWidth={2}
         linkDirectionalParticles={2}
         linkDirectionalParticleSpeed={0.01}
-        nodeCanvasObject={(node: any, ctx, globalScale) => {
+        nodeCanvasObject={(node, ctx, globalScale) => {
+          const x = node.x ?? 0;
+          const y = node.y ?? 0;
+
           // Draw a glowing node
           ctx.beginPath();
-          ctx.arc(node.x, node.y, node.val / 2, 0, 2 * Math.PI, false);
+          ctx.arc(x, y, node.val / 2, 0, 2 * Math.PI, false);
           ctx.fillStyle = node.color;
           ctx.fill();
 
           // Outer Glow
           ctx.shadowBlur = 15;
           ctx.shadowColor = node.color;
-          
+
           // Label
-          const label = node.name;
           const fontSize = 12 / globalScale;
           ctx.font = `${fontSize}px "Fira Code", monospace`;
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
-          ctx.fillText(label, node.x, node.y + (node.val / 2) + fontSize);
-          
+          ctx.fillText(node.name, x, y + (node.val / 2) + fontSize);
+
           // Reset shadow for other elements
           ctx.shadowBlur = 0;
         }}

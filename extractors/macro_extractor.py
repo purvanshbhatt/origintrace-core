@@ -10,13 +10,20 @@ import re
 import logging
 from typing import Dict, Any, List
 
+from extractors.ioc import URL_RE
+
 logger = logging.getLogger("origintrace.macro_extractor")
+
+MAX_MACRO_SOURCE_CHARS = 4000   # truncate for the LLM context window
 
 # VBA keywords that indicate malicious intent
 SUSPICIOUS_VBA_KEYWORDS = [
     re.compile(r'\bAutoOpen\b', re.IGNORECASE),
     re.compile(r'\bAuto_Open\b', re.IGNORECASE),
+    re.compile(r'\bAutoExec\b', re.IGNORECASE),
+    re.compile(r'\bAutoClose\b', re.IGNORECASE),
     re.compile(r'\bDocument_Open\b', re.IGNORECASE),
+    re.compile(r'\bDocument_Close\b', re.IGNORECASE),
     re.compile(r'\bWorkbook_Open\b', re.IGNORECASE),
     re.compile(r'\bShell\b', re.IGNORECASE),
     re.compile(r'\bCreateObject\b', re.IGNORECASE),
@@ -24,14 +31,49 @@ SUSPICIOUS_VBA_KEYWORDS = [
     re.compile(r'\bPowerShell\b', re.IGNORECASE),
     re.compile(r'\bCmd\.exe\b', re.IGNORECASE),
     re.compile(r'\bURLDownloadToFile\b', re.IGNORECASE),
-    re.compile(r'\bMsgBox\b', re.IGNORECASE),
     re.compile(r'\bCallByName\b', re.IGNORECASE),
     re.compile(r'\bGetObject\b', re.IGNORECASE),
     re.compile(r'\bEnviron\b', re.IGNORECASE),
     re.compile(r'\bChrW?\s*\(', re.IGNORECASE),  # Character code obfuscation
 ]
 
-URL_PATTERN = re.compile(r'https?://[^\s"\'`\\>]+')
+_OLE_NATIVE_STREAM = "\x01ole10native"
+
+
+def scan_macro_source(source: str) -> Dict[str, List[str]]:
+    """Scan VBA source for suspicious keywords and embedded URLs."""
+    keywords: List[str] = []
+    seen = set()
+    for pattern in SUSPICIOUS_VBA_KEYWORDS:
+        for match in pattern.finditer(source):
+            kw = match.group(0).strip()
+            if kw and kw.lower() not in seen:
+                seen.add(kw.lower())
+                keywords.append(kw)
+
+    urls = list(dict.fromkeys(match.group(0).rstrip(".,;:") for match in URL_RE.finditer(source)))
+    return {"suspicious_keywords": keywords, "embedded_urls": urls}
+
+
+def _embedded_ole_objects(file_path: str) -> List[str]:
+    """List OLE objects embedded in a document (droppers hide payloads here)."""
+    from oletools import oleobj
+
+    objects: List[str] = []
+    for ole in oleobj.find_ole(file_path, None):
+        if ole is None:
+            continue
+        for stream_parts in ole.listdir():
+            if stream_parts[-1].lower() != _OLE_NATIVE_STREAM:
+                continue
+            label = "<embedded>"
+            try:
+                native = oleobj.OleNativeStream(ole.openstream(stream_parts))
+                label = native.filename or native.src_path or label
+            except Exception as e:
+                logger.debug(f"[MacroExtractor] Unparseable Ole10Native stream: {e}")
+            objects.append(f"OLE Object #{len(objects)}: {label}")
+    return objects
 
 
 class MacroExtractor:
@@ -54,7 +96,12 @@ class MacroExtractor:
 
         try:
             from oletools.olevba import VBA_Parser
+        except ImportError:
+            logger.warning("[MacroExtractor] oletools not installed; macro analysis skipped")
+            return result
 
+        vba_parser = None
+        try:
             vba_parser = VBA_Parser(file_path)
             result["doc_type"] = vba_parser.type or "unknown"
 
@@ -63,59 +110,46 @@ class MacroExtractor:
 
                 # Extract all VBA macro source code
                 all_macro_code = []
-                for (filename_vba, stream_path, vba_filename, vba_code) in vba_parser.extract_macros():
+                for (_container, stream_path, vba_filename, vba_code) in vba_parser.extract_macros():
                     if vba_code:
                         all_macro_code.append(
                             f"// --- Module: {vba_filename} (Stream: {stream_path}) ---\n{vba_code}"
                         )
 
-                combined_source = "\n\n".join(all_macro_code)
-                # Truncate for LLM context window
-                if len(combined_source) > 4000:
-                    combined_source = combined_source[:4000] + "\n' [TRUNCATED]"
-                result["macro_source"] = combined_source
+                full_source = "\n\n".join(all_macro_code)
+                # Scan the full source, but only forward a truncated copy.
+                scan = scan_macro_source(full_source)
+                result["suspicious_keywords"] = scan["suspicious_keywords"]
+                result["embedded_urls"] = scan["embedded_urls"]
+                result["high_value_strings"].extend(scan["embedded_urls"])
 
-                # ── Suspicious keyword scan ──
-                for pattern in SUSPICIOUS_VBA_KEYWORDS:
-                    matches = pattern.findall(combined_source)
-                    for match in matches:
-                        kw = match.strip()
-                        if kw and kw not in result["suspicious_keywords"]:
-                            result["suspicious_keywords"].append(kw)
-
-                # ── URL extraction from macro code ──
-                for match in URL_PATTERN.finditer(combined_source):
-                    url = match.group()
-                    if url not in result["embedded_urls"]:
-                        result["embedded_urls"].append(url)
-                        result["high_value_strings"].append(url)
+                if len(full_source) > MAX_MACRO_SOURCE_CHARS:
+                    full_source = full_source[:MAX_MACRO_SOURCE_CHARS] + "\n' [TRUNCATED]"
+                result["macro_source"] = full_source
 
                 # ── oletools analysis results (IOCs, suspicious patterns) ──
                 try:
-                    analysis = vba_parser.analyze_macros()
-                    for (kw_type, keyword, description) in analysis:
+                    for (kw_type, keyword, _description) in vba_parser.analyze_macros():
                         entry = f"{kw_type}: {keyword}"
                         if entry not in result["high_value_strings"]:
                             result["high_value_strings"].append(entry)
-                except Exception:
-                    pass
-
-            # ── OLE embedded objects ──
-            try:
-                from oletools import oleobj
-                for index, ole_obj in enumerate(oleobj.find_ole(file_path)):
-                    if hasattr(ole_obj, "filename"):
-                        result["embedded_ole_objects"].append(
-                            f"OLE Object #{index}: {ole_obj.filename}"
-                        )
-                    else:
-                        result["embedded_ole_objects"].append(f"OLE Object #{index}: <embedded>")
-            except Exception:
-                pass  # Not all documents have embedded OLE objects
-
-            vba_parser.close()
+                except Exception as e:
+                    logger.debug(f"[MacroExtractor] analyze_macros failed: {e}")
 
         except Exception as e:
             logger.warning(f"[MacroExtractor] oletools failed: {e}")
+        finally:
+            if vba_parser is not None:
+                try:
+                    vba_parser.close()
+                except Exception:
+                    pass
+
+        # ── OLE embedded objects ──
+        try:
+            result["embedded_ole_objects"] = _embedded_ole_objects(file_path)
+        except Exception as e:
+            # Not all documents have embedded OLE objects
+            logger.debug(f"[MacroExtractor] OLE object scan skipped: {e}")
 
         return result

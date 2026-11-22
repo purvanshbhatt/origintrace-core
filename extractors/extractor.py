@@ -1,40 +1,40 @@
 """
 OriginTrace — Universal File Type Router
 
-Autonomous MIME-based routing gateway that inspects magic bytes to determine
-file type, then dispatches to the appropriate specialized extractor:
+Autonomous routing gateway that inspects magic bytes to determine file type,
+then dispatches to the appropriate specialized extractor:
 
-  PE (x-dosexec)     → PEExtractor + ConcolicEngine + r2ghidra
-  ELF (x-executable) → ELFExtractor + r2ghidra
-  Script (text/*)     → ScriptExtractor (AST + regex + entropy)
-  Document (ms-office)→ MacroExtractor (oletools VBA extraction)
+  PE (MZ)             → pefile + r2ghidra + ConcolicEngine
+  ELF (\\x7fELF)       → ELFExtractor + r2ghidra
+  Script / plain text → ScriptExtractor (AST + regex + entropy)
+  Office document     → MacroExtractor (oletools VBA extraction)
 
 All extractors produce a normalized dict that maps to the ExtractionResult
-Pydantic schema before being passed to the LLM Intelligence Agent.
+Pydantic schema before being passed to the analysis agents.
+
+Heavy or system-level tooling (radare2, angr, libmagic, FAISS) is optional:
+when a tool is missing the router degrades to pure-Python analysis instead
+of failing. `get_capabilities()` reports what is available.
 """
+import functools
 import hashlib
+import importlib.util
 import os
 import re
 import logging
-import pefile
-import r2pipe
-from typing import Dict, Any, List
+import threading
+import zipfile
+from typing import Dict, Any, List, Optional
 
 from extractors.elf_extractor import ELFExtractor
+from extractors.ioc import is_ioc, scan_file_for_iocs
+from extractors.r2util import current_seek, open_r2, r2_available
 from extractors.script_extractor import ScriptExtractor
 from extractors.macro_extractor import MacroExtractor
 
 # Lazy imports for heavy dependencies (angr, faiss, sentence-transformers)
 # These are only loaded when actually needed in production
-_provenance_engine_cls = None
 _resolve_with_timeout = None
-
-def _get_provenance_engine():
-    global _provenance_engine_cls
-    if _provenance_engine_cls is None:
-        from extractors.provenance import ProvenanceEngine
-        _provenance_engine_cls = ProvenanceEngine
-    return _provenance_engine_cls()
 
 def _get_resolve_with_timeout():
     global _resolve_with_timeout
@@ -44,6 +44,17 @@ def _get_resolve_with_timeout():
     return _resolve_with_timeout
 
 logger = logging.getLogger("origintrace.extractor")
+
+MAX_DECOMPILED_CHARS = 2000
+MAX_DECOMPILED_FUNCTIONS = 8    # bound r2ghidra work and LLM context
+MAX_XREFS_PER_API = 3
+MAX_CONCOLIC_TARGETS = 3        # each target may cost a full concolic timeout
+CONCOLIC_TIMEOUT_SECONDS = 15
+HASH_CHUNK_BYTES = 1024 * 1024
+TEXT_SNIFF_BYTES = 8192
+
+SUSPICIOUS_APIS = ["VirtualAlloc", "CryptEncrypt", "InternetOpen",
+                   "CreateProcess", "GetProcAddress", "LoadLibrary"]
 
 # Regex patterns for detecting obfuscation candidates in decompiled C
 OBFUSCATION_PATTERNS = [
@@ -86,7 +97,7 @@ MIME_ROUTING_TABLE = {
     "application/vnd.ms-word.document.macroEnabled.12": "document",
 }
 
-# Extension-based fallback for when libmagic isn't available or returns text/plain
+# Extension-based fallback for when neither magic bytes nor libmagic decide
 EXTENSION_FALLBACK = {
     ".exe": "pe", ".dll": "pe", ".sys": "pe", ".scr": "pe",
     ".elf": "elf", ".so": "elf", ".o": "elf",
@@ -100,87 +111,169 @@ EXTENSION_FALLBACK = {
     ".ppt": "document", ".pptm": "document", ".pptx": "document",
 }
 
+_OOXML_PREFIXES = ("word/", "xl/", "ppt/")
+_TEXT_BOMS = (b"\xff\xfe", b"\xfe\xff", b"\xef\xbb\xbf")
 
-def _detect_file_type(file_path: str, filename: str) -> str:
-    """
-    Detect file type using python-magic (libmagic), with extension fallback.
-    Returns one of: 'pe', 'elf', 'script', 'document', 'unknown'.
-    """
-    mime_type = None
 
-    # Strategy 1: python-magic MIME detection
+def _is_ooxml(file_path: str) -> bool:
+    """True when a ZIP container is an Office Open XML document."""
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            names = archive.namelist()
+    except (zipfile.BadZipFile, OSError):
+        return False
+    return "[Content_Types].xml" in names and any(n.startswith(_OOXML_PREFIXES) for n in names)
+
+
+def _looks_like_text(head: bytes) -> bool:
+    """Cheap text sniff: no NULs and almost entirely printable bytes."""
+    if not head:
+        return False
+    if head.startswith(_TEXT_BOMS):
+        return True
+    if b"\x00" in head:
+        return False
+    printable = sum(1 for b in head if b in (9, 10, 13) or 32 <= b <= 126 or b >= 128)
+    return printable / len(head) >= 0.95
+
+
+def _classify_by_header(file_path: str, head: bytes) -> Optional[str]:
+    """Classify from magic bytes, which a renamed file cannot fake."""
+    if head[:2] == b'MZ':
+        return "pe"
+    if head[:4] == b'\x7fELF':
+        return "elf"
+    # OLE Compound Document (legacy Office)
+    if head[:4] == b'\xd0\xcf\x11\xe0':
+        return "document"
+    # OOXML (ZIP-based Office). A plain ZIP is not a document.
+    if head[:4] == b'PK\x03\x04' and _is_ooxml(file_path):
+        return "document"
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _load_magic() -> Optional[Any]:
+    """Import python-magic once; None when the package or libmagic is missing."""
     try:
         import magic
-        mime_type = magic.from_file(file_path, mime=True)
-        logger.info(f"[Router] Detected MIME: {mime_type} for {filename}")
+        return magic
+    except Exception as e:  # ImportError, or OSError when the C library is absent
+        logger.info(f"[Router] libmagic unavailable ({type(e).__name__}); using header and extension detection")
+        return None
 
-        if mime_type in MIME_ROUTING_TABLE:
-            return MIME_ROUTING_TABLE[mime_type]
 
-        # Handle generic text/plain — fall through to extension check
-        if mime_type and mime_type.startswith("text/"):
-            # Could be a script with a generic MIME
-            pass
+def detect_file_type(file_path: str, filename: str) -> str:
+    """
+    Detect file type from magic bytes, then libmagic, extension, and content.
+    Returns one of: 'pe', 'elf', 'script', 'document', 'unknown'.
+    """
+    try:
+        with open(file_path, "rb") as f:
+            head = f.read(TEXT_SNIFF_BYTES)
+    except OSError as e:
+        logger.warning(f"[Router] Could not read {filename}: {e}")
+        head = b""
 
-    except ImportError:
-        logger.warning("[Router] python-magic not installed, falling back to extension detection")
-    except Exception as e:
-        logger.warning(f"[Router] magic detection failed: {e}")
+    # Strategy 1: Magic bytes — authoritative for binaries and Office files
+    by_header = _classify_by_header(file_path, head)
+    if by_header:
+        return by_header
 
-    # Strategy 2: Extension-based fallback
+    # Strategy 2: python-magic MIME detection
+    magic = _load_magic()
+    if magic is not None:
+        try:
+            mime_type = magic.from_file(file_path, mime=True)
+            logger.info(f"[Router] Detected MIME: {mime_type} for {filename}")
+            if mime_type in MIME_ROUTING_TABLE:
+                return MIME_ROUTING_TABLE[mime_type]
+        except Exception as e:
+            logger.warning(f"[Router] magic detection failed: {e}")
+
+    # Strategy 3: Extension-based fallback
     ext = os.path.splitext(filename)[1].lower()
     if ext in EXTENSION_FALLBACK:
         logger.info(f"[Router] Extension fallback: {ext} → {EXTENSION_FALLBACK[ext]}")
         return EXTENSION_FALLBACK[ext]
 
-    # Strategy 3: Magic bytes header check (last resort)
-    try:
-        with open(file_path, "rb") as f:
-            header = f.read(4)
-        if header[:2] == b'MZ':
-            return "pe"
-        if header[:4] == b'\x7fELF':
-            return "elf"
-        if header[:2] == b'#!':
-            return "script"
-        # OLE Compound Document (legacy Office)
-        if header[:4] == b'\xd0\xcf\x11\xe0':
-            return "document"
-        # OOXML (ZIP-based Office)
-        if header[:4] == b'PK\x03\x04':
-            return "document"
-    except Exception:
-        pass
+    # Strategy 4: Plain text of any kind gets the script scanner
+    if _looks_like_text(head):
+        return "script"
 
     return "unknown"
 
 
 def _compute_hashes(file_path: str) -> Dict[str, Any]:
-    """Compute SHA256, MD5 and file size."""
+    """Compute SHA256, MD5 and file size without loading the file into memory."""
     result = {"sha256": None, "md5": None, "size": None}
     try:
+        sha256, md5, size = hashlib.sha256(), hashlib.md5(), 0
         with open(file_path, "rb") as f:
-            data = f.read()
-            result["sha256"] = hashlib.sha256(data).hexdigest()
-            result["md5"] = hashlib.md5(data).hexdigest()
-            result["size"] = len(data)
-    except Exception as e:
+            while chunk := f.read(HASH_CHUNK_BYTES):
+                sha256.update(chunk)
+                md5.update(chunk)
+                size += len(chunk)
+        result = {"sha256": sha256.hexdigest(), "md5": md5.hexdigest(), "size": size}
+    except OSError as e:
         logger.warning(f"[Hashes] Failed: {e}")
     return result
+
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def get_capabilities() -> Dict[str, bool]:
+    """Report which optional analysis tooling this process can use."""
+    return {
+        "radare2": r2_available(),
+        "pefile": _module_available("pefile"),
+        "pyelftools": _module_available("elftools"),
+        "oletools": _module_available("oletools"),
+        "libmagic": _load_magic() is not None,
+        "angr": _module_available("angr"),
+        "faiss_provenance": _module_available("faiss") and _module_available("sentence_transformers"),
+    }
 
 
 class MasterBinaryExtractor:
     """
     Universal file type router. Determines the input format via magic bytes,
     dispatches to the appropriate specialized extractor, and normalizes
-    the output into a unified schema for the LLM pipeline.
+    the output into a unified schema for the analysis pipeline.
     """
 
-    def __init__(self):
-        self.provenance_engine = _get_provenance_engine()
+    def __init__(self, provenance_engine: Optional[Any] = None):
+        # The provenance engine can take seconds to load (embedding model),
+        # so it is built on first use rather than at startup.
+        self._provenance_engine = provenance_engine
+        self._provenance_ready = provenance_engine is not None
+        self._provenance_lock = threading.Lock()
         self.elf_extractor = ELFExtractor()
         self.script_extractor = ScriptExtractor()
         self.macro_extractor = MacroExtractor()
+
+    @property
+    def provenance_engine(self) -> Optional[Any]:
+        """The provenance engine, created lazily (None when disabled)."""
+        if not self._provenance_ready:
+            with self._provenance_lock:
+                if not self._provenance_ready:
+                    from extractors.provenance import get_provenance_engine
+                    self._provenance_engine = get_provenance_engine()
+                    self._provenance_ready = True
+        return self._provenance_engine
+
+    def warm_up(self) -> None:
+        """Load the provenance engine ahead of the first request."""
+        try:
+            _ = self.provenance_engine
+        except Exception as e:
+            logger.warning(f"[Router] Provenance warm-up failed: {e}")
 
     def extract_all(self, file_path: str, filename: str) -> Dict[str, Any]:
         """
@@ -188,8 +281,12 @@ class MasterBinaryExtractor:
         based on detected file type, then runs provenance analysis.
         """
         # ── Step 0: Detect file type ──
-        file_type = _detect_file_type(file_path, filename)
+        file_type = detect_file_type(file_path, filename)
         logger.info(f"[Router] File '{filename}' classified as: {file_type}")
+
+        # A known extension that contradicts the content is itself a signal.
+        claimed_type = EXTENSION_FALLBACK.get(os.path.splitext(filename)[1].lower())
+        extension_mismatch = bool(claimed_type and file_type != "unknown" and claimed_type != file_type)
 
         # ── Step 1: Compute universal metadata ──
         hashes = _compute_hashes(file_path)
@@ -200,6 +297,7 @@ class MasterBinaryExtractor:
                 "md5": hashes["md5"],
                 "size": hashes["size"],
                 "file_type": file_type,
+                "extension_mismatch": extension_mismatch,
             },
             "file_type": file_type,
             "binary_features": None,
@@ -242,10 +340,10 @@ class MasterBinaryExtractor:
                 all_strings = features.get("high_value_strings", [])
 
             else:
-                # Unknown file type — attempt basic string extraction
+                # Unknown binary format — fall back to raw string extraction
                 result["status"] = "warning: unknown file type, limited analysis performed"
-                result["script_features"] = self._extract_unknown(file_path, filename)
-                all_strings = result["script_features"].get("high_value_strings", [])
+                result["binary_features"] = self._extract_unknown(file_path)
+                all_strings = result["binary_features"]["high_value_strings"]
 
         except Exception as e:
             result["status"] = f"error: extraction failed - {str(e)}"
@@ -253,8 +351,9 @@ class MasterBinaryExtractor:
 
         # ── Step 3: Semantic Provenance Engine (universal) ──
         try:
-            provenance_data = self.provenance_engine.analyze_delta(all_strings, all_imports)
-            result["provenance"] = provenance_data
+            engine = self.provenance_engine
+            if engine is not None:
+                result["provenance"] = engine.analyze_delta(all_strings, all_imports)
         except Exception as e:
             result["status"] = f"{result['status']} | Warning: Provenance Engine failed - {str(e)}"
 
@@ -272,170 +371,171 @@ class MasterBinaryExtractor:
             "imphash": None,
         }
 
-        all_strings = []
         concolic_targets: List[Dict[str, Any]] = []
 
         # ── pefile: Shallow PE Parsing ──
         try:
+            import pefile
+
             pe = pefile.PE(file_path)
+            try:
+                features["imphash"] = pe.get_imphash()
 
-            features["imphash"] = pe.get_imphash()
+                if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+                    for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                        dll_name = entry.dll.decode("utf-8", errors="ignore") if entry.dll else "unknown.dll"
+                        for imp in entry.imports:
+                            if imp.name:
+                                func = imp.name.decode("utf-8", errors="ignore")
+                                import_str = f"{dll_name}:{func}"
+                                features["imports"].append(import_str)
 
-            if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
-                for entry in pe.DIRECTORY_ENTRY_IMPORT:
-                    dll_name = entry.dll.decode("utf-8", errors="ignore") if entry.dll else "unknown.dll"
-                    for imp in entry.imports:
-                        if imp.name:
-                            func = imp.name.decode("utf-8", errors="ignore")
-                            import_str = f"{dll_name}:{func}"
-                            features["imports"].append(import_str)
-
-            for section in pe.sections:
-                sec_name = section.Name.decode("utf-8", errors="ignore").rstrip("\x00")
-                entropy = section.get_entropy()
-                features["sections"].append(f"{sec_name} (Entropy: {entropy:.2f})")
+                for section in pe.sections:
+                    sec_name = section.Name.decode("utf-8", errors="ignore").rstrip("\x00")
+                    entropy = section.get_entropy()
+                    features["sections"].append(f"{sec_name} (Entropy: {entropy:.2f})")
+            finally:
+                pe.close()
 
         except Exception as e:
             logger.warning(f"[PEExtractor] pefile failed: {e}")
 
         # ── r2ghidra: Deep Decompilation ──
         try:
-            r2 = r2pipe.open(file_path)
-
-            info = r2.cmdj("iIj")
-            if info and info.get("bintype", "any") == "any":
-                r2.quit()
-                return features
-
-            r2.cmd("aa")
-
-            # IOC string filtering
-            strings_json = r2.cmdj("izj")
-            if strings_json:
-                ioc_patterns = [
-                    re.compile(r'(?:[0-9]{1,3}\.){3}[0-9]{1,3}'),
-                    re.compile(r'https?://[^\s]+'),
-                    re.compile(r'[A-Za-z]:\\[^\s]+'),
-                    re.compile(r'HK[LC]U\\[^\s]+'),
-                    re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
-                ]
-                for s in strings_json:
-                    string_val = s.get("string", "")
-                    if any(pattern.search(string_val) for pattern in ioc_patterns):
-                        all_strings.append(string_val)
-                        features["high_value_strings"].append(string_val)
-
-            # Exported functions
-            exports_json = r2.cmdj("iEj")
-            if exports_json:
-                for exp in exports_json:
-                    if "name" in exp:
-                        all_strings.append(f"EXPORT:{exp['name']}")
-
-            # Decompile entry point
-            r2.cmd("s entry0")
-            entry_addr = r2.cmdj("sj") or 0
-            try:
-                disasm_json = r2.cmdj("pdgj")
-                if disasm_json and isinstance(disasm_json, dict) and "code" in disasm_json:
-                    code = disasm_json["code"]
-                    if len(code) > 2000:
-                        code = code[:2000] + "\n// [TRUNCATED]"
-
-                    features["functions"].append({
-                        "name": "entry0",
-                        "decompiled_c": code,
-                        "symbolic_resolved_strings": []
-                    })
-
-                    if _has_obfuscation_markers(code):
-                        concolic_targets.append({
-                            "func_index": len(features["functions"]) - 1,
-                            "start_addr": entry_addr if isinstance(entry_addr, int) else 0
-                        })
-            except Exception:
-                pass
-
-            # Targeted decompilation for suspicious API callers
-            suspicious_apis = ["VirtualAlloc", "CryptEncrypt", "InternetOpen",
-                               "CreateProcess", "GetProcAddress", "LoadLibrary"]
-            imports_json = r2.cmdj("iij")
-            if imports_json:
-                for imp in imports_json:
-                    imp_name = imp.get("name", "")
-                    if any(sus_api.lower() in imp_name.lower() for sus_api in suspicious_apis):
-                        xrefs = r2.cmdj(f"axtj sym.imp.{imp_name}")
-                        if not xrefs:
-                            xrefs = r2.cmdj(f"axtj {imp_name}")
-                        if xrefs:
-                            for xref in xrefs[:3]:
-                                call_addr = xref.get("from", 0)
-                                if call_addr:
-                                    try:
-                                        r2.cmd(f"s {call_addr}")
-                                        func_decomp = r2.cmdj("pdgj")
-                                        if func_decomp and isinstance(func_decomp, dict) and "code" in func_decomp:
-                                            code = func_decomp["code"]
-                                            if len(code) > 2000:
-                                                code = code[:2000] + "\n// [TRUNCATED]"
-
-                                            features["functions"].append({
-                                                "name": f"func_{imp_name}_0x{call_addr:08x}",
-                                                "decompiled_c": code,
-                                                "symbolic_resolved_strings": []
-                                            })
-
-                                            if _has_obfuscation_markers(code):
-                                                concolic_targets.append({
-                                                    "func_index": len(features["functions"]) - 1,
-                                                    "start_addr": call_addr
-                                                })
-                                    except Exception:
-                                        pass
-
-            r2.quit()
+            self._extract_pe_with_r2(file_path, features, concolic_targets)
         except Exception as e:
             logger.warning(f"[PEExtractor] r2pipe failed: {e}")
+
+        # ── Fallback: pure-Python string scan when r2 gave us nothing ──
+        if not features["high_value_strings"]:
+            try:
+                features["high_value_strings"] = scan_file_for_iocs(file_path)
+            except OSError as e:
+                logger.warning(f"[PEExtractor] string scan failed: {e}")
 
         # ── Concolic Execution ──
         if concolic_targets:
             try:
-                for target in concolic_targets:
-                    resolve_fn = _get_resolve_with_timeout()
+                resolve_fn = _get_resolve_with_timeout()
+                for target in concolic_targets[:MAX_CONCOLIC_TARGETS]:
                     resolved = resolve_fn(
                         binary_path=file_path,
                         start_addr=target["start_addr"],
-                        timeout=15
+                        timeout=CONCOLIC_TIMEOUT_SECONDS
                     )
                     if resolved:
                         idx = target["func_index"]
                         features["functions"][idx]["symbolic_resolved_strings"] = resolved
-                        all_strings.extend(resolved)
-                        features["high_value_strings"].extend(resolved)
+                        for value in resolved:
+                            if value not in features["high_value_strings"]:
+                                features["high_value_strings"].append(value)
                         logger.info(f"[Concolic] Resolved {len(resolved)} strings at 0x{target['start_addr']:08x}")
             except Exception as e:
                 logger.warning(f"[PEExtractor] Concolic engine failed: {e}")
 
         return features
 
+    def _extract_pe_with_r2(self, file_path: str, features: Dict[str, Any],
+                            concolic_targets: List[Dict[str, Any]]) -> None:
+        """Populate strings and decompiled functions via radare2 + r2ghidra."""
+        r2 = open_r2(file_path)
+        if r2 is None:
+            return
+
+        try:
+            info = r2.cmdj("iIj")
+            if info and info.get("bintype", "any") == "any":
+                return
+
+            r2.cmd("aa")
+
+            # IOC string filtering
+            strings_json = r2.cmdj("izj")
+            if strings_json:
+                for s in strings_json:
+                    string_val = s.get("string", "")
+                    if is_ioc(string_val):
+                        features["high_value_strings"].append(string_val)
+
+            # Decompile entry point
+            r2.cmd("s entry0")
+            self._decompile_at_seek(r2, "entry0", current_seek(r2), features, concolic_targets)
+
+            # Targeted decompilation for suspicious API callers
+            decompiled_addrs = set()
+            imports_json = r2.cmdj("iij")
+            if imports_json:
+                for imp in imports_json:
+                    imp_name = imp.get("name", "")
+                    if not any(sus_api.lower() in imp_name.lower() for sus_api in SUSPICIOUS_APIS):
+                        continue
+                    xrefs = r2.cmdj(f"axtj sym.imp.{imp_name}")
+                    if not xrefs:
+                        xrefs = r2.cmdj(f"axtj {imp_name}")
+                    for xref in (xrefs or [])[:MAX_XREFS_PER_API]:
+                        if len(features["functions"]) >= MAX_DECOMPILED_FUNCTIONS:
+                            return
+                        call_addr = xref.get("from", 0)
+                        # Decompile (and later emulate) from the start of the
+                        # calling function, not from the call instruction.
+                        fcn_addr = xref.get("fcn_addr") or call_addr
+                        if not fcn_addr or fcn_addr in decompiled_addrs:
+                            continue
+                        decompiled_addrs.add(fcn_addr)
+                        r2.cmd(f"s {fcn_addr}")
+                        name = xref.get("fcn_name") or f"func_{imp_name}_0x{fcn_addr:08x}"
+                        self._decompile_at_seek(r2, name, fcn_addr, features, concolic_targets,
+                                                calls_api=imp_name)
+        finally:
+            r2.quit()
+
+    @staticmethod
+    def _decompile_at_seek(r2: Any, name: str, addr: int, features: Dict[str, Any],
+                           concolic_targets: List[Dict[str, Any]],
+                           calls_api: Optional[str] = None) -> None:
+        """Decompile the function at radare2's current seek via r2ghidra."""
+        try:
+            decomp = r2.cmdj("pdgj")
+        except Exception as e:
+            logger.debug(f"[PEExtractor] decompilation of {name} failed: {e}")
+            return
+        if not (decomp and isinstance(decomp, dict) and "code" in decomp):
+            return
+
+        code = decomp["code"]
+        if len(code) > MAX_DECOMPILED_CHARS:
+            code = code[:MAX_DECOMPILED_CHARS] + "\n// [TRUNCATED]"
+
+        record: Dict[str, Any] = {
+            "name": name,
+            "decompiled_c": code,
+            "symbolic_resolved_strings": []
+        }
+        if calls_api:
+            record["calls_api"] = calls_api
+        features["functions"].append(record)
+
+        if addr and _has_obfuscation_markers(code):
+            concolic_targets.append({
+                "func_index": len(features["functions"]) - 1,
+                "start_addr": addr
+            })
+
     # ── Unknown File Fallback ──────────────────────────────────
 
-    def _extract_unknown(self, file_path: str, filename: str) -> Dict[str, Any]:
-        """Best-effort extraction for unrecognized file types."""
+    def _extract_unknown(self, file_path: str) -> Dict[str, Any]:
+        """Best-effort extraction for unrecognized binary formats."""
         try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                source = f.read(5000)
-        except Exception:
-            source = ""
+            strings = scan_file_for_iocs(file_path)
+        except OSError as e:
+            logger.warning(f"[Router] string scan failed: {e}")
+            strings = []
 
         return {
-            "language": "unknown",
-            "raw_source": source[:3000],
-            "ast_imports": [],
-            "suspicious_calls": [],
-            "encoded_blobs": [],
-            "obfuscation_score": 0.0,
-            "high_value_strings": [],
+            "imports": [],
+            "sections": [],
+            "functions": [],
+            "high_value_strings": strings,
         }
 
 

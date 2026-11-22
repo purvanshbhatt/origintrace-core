@@ -24,6 +24,20 @@ Thumbs.db
 # Output reports
 origintrace_report.json
 
+# Runtime provenance artifacts (FAISS index, registry, delta corpus)
+data/
+
+# Test caches
+.pytest_cache/
+
+# Machine-local dev server config for the Claude desktop preview
+.claude/launch.json
+
+# graphify: keep the report and graph, ignore machine-local state
+graphify-out/*
+!graphify-out/GRAPH_REPORT.md
+!graphify-out/graph.json
+
 # Distribution / packaging
 dist/
 build/

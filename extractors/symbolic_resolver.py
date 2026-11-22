@@ -10,6 +10,8 @@ The engine is memory-safe by design:
   - auto_load_libs=False prevents state explosion from shared library modeling.
   - Each function exploration is time-boxed to TIMEOUT_SECONDS.
   - A hard instruction ceiling (MAX_STEPS) kills runaway paths.
+  - The whole exploration runs in a child process that is terminated if it
+    overruns, so a stuck solver can never hang the API.
 
 Academic Value (SIoU Metric):
   When angr resolves a hidden string deterministically, and the LLM
@@ -19,20 +21,28 @@ Academic Value (SIoU Metric):
 """
 
 import logging
+import multiprocessing
 import string
-import signal
-import angr
-import claripy
-from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+import time
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("origintrace.symbolic")
 
 # --- Configuration ---
-TIMEOUT_SECONDS = 15      # Hard wall-clock timeout per function
+TIMEOUT_SECONDS = 15      # Wall-clock budget for exploring one function
+STARTUP_GRACE_SECONDS = 30  # Extra time for the child to import angr and load the binary
 MAX_STEPS = 50_000        # Maximum basic blocks before aborting
 MAX_ACTIVE_STATES = 128   # Cap active states to prevent memory explosion
+MAX_HARVEST_STATES = 16   # Terminal states inspected for decrypted strings
 MIN_STRING_LENGTH = 4     # Ignore resolved strings shorter than this
+MEMORY_SCAN_BYTES = 4096  # Bytes read from each writable segment
+_POLL_INTERVAL_SECONDS = 0.25
+
+# Argument registers made symbolic, per architecture (Win64 ABI / x86 fastcall).
+_SYMBOLIC_ARG_REGISTERS = {
+    "AMD64": ("rcx", "rdx", "r8", "r9"),
+    "X86": ("ecx", "edx"),
+}
 
 
 class ConcolicEngine:
@@ -47,19 +57,21 @@ class ConcolicEngine:
             binary_path: Absolute path to the PE/ELF binary on disk.
         """
         self.binary_path = binary_path
+        self.project = None
         try:
-            self.project = angr.Project(
-                binary_path,
-                auto_load_libs=False,
-                load_options={"main_opts": {"base_addr": 0x400000}}
-            )
-            self.cfg = None  # Lazy-loaded on demand
+            # angr is imported lazily: it is heavy and optional.
+            import angr
+
+            self._angr = angr
+            # The binary is mapped at its own preferred base so that addresses
+            # reported by radare2 line up with angr's address space.
+            self.project = angr.Project(binary_path, auto_load_libs=False)
             logger.info(f"[ConcolicEngine] Loaded binary: {binary_path}")
         except Exception as e:
             logger.error(f"[ConcolicEngine] Failed to load binary: {e}")
-            self.project = None
 
-    def explore_function(self, start_addr: int, end_addr: Optional[int] = None) -> List[str]:
+    def explore_function(self, start_addr: int, end_addr: Optional[int] = None,
+                         timeout: float = TIMEOUT_SECONDS) -> List[str]:
         """
         Symbolically execute a bounded function region and extract any
         printable ASCII strings resolved by the constraint solver.
@@ -68,6 +80,7 @@ class ConcolicEngine:
             start_addr: Entry address of the target function/basic block.
             end_addr:   Optional exit address. If None, angr will explore
                         until it hits a return or the step limit.
+            timeout:    Wall-clock budget in seconds.
 
         Returns:
             List of resolved plaintext strings (URLs, DLL names, API names).
@@ -75,7 +88,11 @@ class ConcolicEngine:
         if not self.project:
             return []
 
+        import claripy
+
+        angr = self._angr
         resolved_strings: List[str] = []
+        deadline = time.monotonic() + timeout
 
         try:
             # Create a blank state at the function entry with symbolic registers
@@ -87,12 +104,11 @@ class ConcolicEngine:
                 }
             )
 
-            # Inject symbolic bitvectors into common argument registers
-            # This simulates unknown inputs to decryption routines
-            sym_rcx = claripy.BVS("sym_rcx", 64)
-            sym_rdx = claripy.BVS("sym_rdx", 64)
-            state.regs.rcx = sym_rcx
-            state.regs.rdx = sym_rdx
+            # Inject symbolic bitvectors into the argument registers.
+            # This simulates unknown inputs to decryption routines.
+            arch = self.project.arch
+            for reg_name in _SYMBOLIC_ARG_REGISTERS.get(arch.name, ()):
+                setattr(state.regs, reg_name, claripy.BVS(f"sym_{reg_name}", arch.bits))
 
             # Configure the simulation manager
             simgr = self.project.factory.simgr(state)
@@ -102,13 +118,13 @@ class ConcolicEngine:
 
             # Step through the function with bounded execution
             step_count = 0
-            while len(simgr.active) > 0 and step_count < MAX_STEPS:
+            while len(simgr.active) > 0 and step_count < MAX_STEPS and time.monotonic() < deadline:
                 simgr.step()
                 step_count += 1
 
                 # Cap active states to prevent memory explosion
                 if len(simgr.active) > MAX_ACTIVE_STATES:
-                    simgr.active = simgr.active[:MAX_ACTIVE_STATES]
+                    simgr.split(from_stash="active", to_stash="overflow", limit=MAX_ACTIVE_STATES)
 
                 # If we have a target end address, check for found states
                 if find_addrs:
@@ -117,9 +133,11 @@ class ConcolicEngine:
                     if simgr.found:
                         break
 
-            # Harvest strings from all terminal states
-            harvest_states = simgr.found if simgr.found else simgr.deadended
-            for terminal_state in harvest_states:
+            # Harvest strings from terminal states; fall back to whatever is
+            # still running if the budget expired first.
+            stashes = simgr.stashes
+            harvest_states = stashes.get("found") or stashes.get("deadended") or stashes.get("active") or []
+            for terminal_state in harvest_states[:MAX_HARVEST_STATES]:
                 resolved_strings.extend(
                     self._extract_strings_from_state(terminal_state)
                 )
@@ -128,9 +146,9 @@ class ConcolicEngine:
             logger.warning(f"[ConcolicEngine] Exploration failed at 0x{start_addr:08x}: {e}")
 
         # Deduplicate and return
-        return list(set(resolved_strings))
+        return sorted(set(resolved_strings))
 
-    def _extract_strings_from_state(self, state: angr.SimState) -> List[str]:
+    def _extract_strings_from_state(self, state: Any) -> List[str]:
         """
         Inspect a terminal simulation state for printable ASCII strings
         in stdout, memory dumps, and register evaluations.
@@ -152,7 +170,7 @@ class ConcolicEngine:
                     if seg.is_writable and seg.memsize < 0x10000:  # cap at 64KB
                         try:
                             mem_data = state.solver.eval(
-                                state.memory.load(seg.min_addr, min(seg.memsize, 1024)),
+                                state.memory.load(seg.min_addr, min(seg.memsize, MEMORY_SCAN_BYTES)),
                                 cast_to=bytes
                             )
                             decoded = mem_data.decode("ascii", errors="ignore")
@@ -212,6 +230,61 @@ class ConcolicEngine:
         return False
 
 
+def _child_entry(conn: Any, target: Callable[..., Any], args: Sequence[Any]) -> None:
+    """Child-process trampoline: run ``target`` and ship the outcome back."""
+    try:
+        conn.send((True, target(*args)))
+    except BaseException as e:  # report every failure; the parent decides
+        conn.send((False, f"{type(e).__name__}: {e}"))
+    finally:
+        conn.close()
+
+
+def run_with_hard_timeout(target: Callable[..., Any], args: Sequence[Any],
+                          timeout: float) -> Tuple[bool, Any]:
+    """
+    Run ``target(*args)`` in a child process and kill it if it overruns.
+
+    A thread cannot be cancelled, so a thread-based timeout would leave a
+    runaway solver burning CPU (and would block on executor shutdown). A
+    spawned process can be terminated outright.
+
+    Returns:
+        (True, result) on success; (False, None) on timeout or child failure.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_child_entry, args=(child_conn, target, tuple(args)), daemon=True)
+    proc.start()
+    child_conn.close()
+    deadline = time.monotonic() + timeout
+    try:
+        # Poll in short slices so a child that dies early (import error,
+        # crash) is noticed immediately instead of after the full timeout.
+        while not parent_conn.poll(_POLL_INTERVAL_SECONDS):
+            if time.monotonic() >= deadline:
+                return False, None
+            if not proc.is_alive() and not parent_conn.poll(0):
+                logger.warning(f"[ConcolicEngine] Worker exited with code {proc.exitcode} before reporting")
+                return False, None
+        ok, payload = parent_conn.recv()
+        if not ok:
+            logger.warning(f"[ConcolicEngine] Worker failed: {payload}")
+            return False, None
+        return True, payload
+    except (EOFError, OSError) as e:
+        logger.warning(f"[ConcolicEngine] Worker exited unexpectedly: {e}")
+        return False, None
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            if proc.is_alive():
+                proc.kill()
+        proc.join(1)
+        parent_conn.close()
+
+
 def resolve_with_timeout(binary_path: str, start_addr: int,
                          end_addr: Optional[int] = None,
                          timeout: int = TIMEOUT_SECONDS) -> List[str]:
@@ -224,25 +297,24 @@ def resolve_with_timeout(binary_path: str, start_addr: int,
         binary_path: Path to the binary file.
         start_addr:  Function entry address.
         end_addr:    Optional function exit address.
-        timeout:     Maximum seconds before aborting.
+        timeout:     Maximum seconds of exploration before aborting.
 
     Returns:
         List of resolved strings, or empty list on timeout/error.
     """
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run_engine, binary_path, start_addr, end_addr)
-            return future.result(timeout=timeout)
-    except FuturesTimeout:
-        logger.warning(f"[ConcolicEngine] Timeout ({timeout}s) at 0x{start_addr:08x}")
+    ok, resolved = run_with_hard_timeout(
+        _run_engine,
+        (binary_path, start_addr, end_addr, timeout),
+        timeout=timeout + STARTUP_GRACE_SECONDS,
+    )
+    if not ok:
+        logger.warning(f"[ConcolicEngine] No result within {timeout}s at 0x{start_addr:08x}")
         return []
-    except Exception as e:
-        logger.warning(f"[ConcolicEngine] Subprocess error: {e}")
-        return []
+    return resolved or []
 
 
 def _run_engine(binary_path: str, start_addr: int,
-                end_addr: Optional[int]) -> List[str]:
+                end_addr: Optional[int], timeout: float = TIMEOUT_SECONDS) -> List[str]:
     """Worker function executed in a subprocess."""
     engine = ConcolicEngine(binary_path)
-    return engine.explore_function(start_addr, end_addr)
+    return engine.explore_function(start_addr, end_addr, timeout=timeout)

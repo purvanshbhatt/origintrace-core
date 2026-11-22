@@ -5,13 +5,18 @@ Parses Linux ELF executables and shared objects using pyelftools for header
 inspection and r2ghidra for deep decompilation. Outputs a BinaryFeatures
 schema with ELF-specific fields (elf_type, elf_machine, elf_symbols).
 """
-import hashlib
 import re
 import logging
-import r2pipe
-from typing import Dict, Any, List
+from typing import Dict, Any
+
+from extractors.ioc import is_ioc, scan_file_for_iocs
+from extractors.r2util import open_r2
 
 logger = logging.getLogger("origintrace.elf_extractor")
+
+MAX_SYMBOLS = 300          # keep the SSE payload and LLM context bounded
+MAX_DECOMPILED_CHARS = 2000
+_ELF_PATH_RE = re.compile(r'/etc/|/tmp/|/dev/|/proc/')
 
 
 class ELFExtractor:
@@ -35,6 +40,7 @@ class ELFExtractor:
         # ── pyelftools: Header + Symbol Table ──
         try:
             from elftools.elf.elffile import ELFFile
+            from elftools.elf.sections import SymbolTableSection
 
             with open(file_path, "rb") as f:
                 elf = ELFFile(f)
@@ -42,51 +48,66 @@ class ELFExtractor:
                 result["elf_type"] = elf.header["e_type"]
                 result["elf_machine"] = elf.header["e_machine"]
 
-                # Section entropy approximation
+                imports: Dict[str, None] = {}
+                symbols: Dict[str, None] = {}
                 for section in elf.iter_sections():
                     name = section.name or "<unnamed>"
                     size = section["sh_size"]
                     result["sections"].append(f"{name} (Size: {size})")
 
-                # Dynamic symbol table (equivalent to IAT for ELF)
-                from elftools.elf.sections import SymbolTableSection
-                for section in elf.iter_sections():
+                    # Symbol tables (.dynsym is the ELF equivalent of the IAT)
                     if isinstance(section, SymbolTableSection):
                         for sym in section.iter_symbols():
-                            if sym.name and sym["st_shndx"] == "SHN_UNDEF":
+                            if not sym.name:
+                                continue
+                            if sym["st_shndx"] == "SHN_UNDEF":
                                 # Undefined = external dependency (like an import)
-                                result["imports"].append(sym.name)
-                                result["elf_symbols"].append(sym.name)
-                            elif sym.name:
-                                result["elf_symbols"].append(f"LOCAL:{sym.name}")
+                                imports[sym.name] = None
+                                symbols[sym.name] = None
+                            else:
+                                symbols[f"LOCAL:{sym.name}"] = None
+
+                result["imports"] = list(imports)
+                result["elf_symbols"] = list(symbols)[:MAX_SYMBOLS]
 
         except Exception as e:
             logger.warning(f"[ELFExtractor] pyelftools failed: {e}")
 
         # ── r2ghidra: Deep Decompilation ──
         try:
-            r2 = r2pipe.open(file_path)
+            self._extract_with_r2(file_path, result)
+        except Exception as e:
+            logger.warning(f"[ELFExtractor] r2pipe failed: {e}")
 
+        # ── Fallback: pure-Python string scan when r2 gave us nothing ──
+        if not result["high_value_strings"]:
+            try:
+                result["high_value_strings"] = scan_file_for_iocs(file_path)
+            except OSError as e:
+                logger.warning(f"[ELFExtractor] string scan failed: {e}")
+
+        return result
+
+    def _extract_with_r2(self, file_path: str, result: Dict[str, Any]) -> None:
+        """Populate strings and the decompiled entry point via radare2."""
+        r2 = open_r2(file_path)
+        if r2 is None:
+            return
+
+        try:
             # Verify it's a real binary
             info = r2.cmdj("iIj")
             if info and info.get("bintype", "any") == "any":
-                r2.quit()
-                return result
+                return
 
             r2.cmd("aa")
 
             # IOC-grade string filtering
             strings_json = r2.cmdj("izj")
             if strings_json:
-                ioc_patterns = [
-                    re.compile(r'(?:[0-9]{1,3}\.){3}[0-9]{1,3}'),
-                    re.compile(r'https?://[^\s]+'),
-                    re.compile(r'/etc/|/tmp/|/dev/|/proc/'),
-                    re.compile(r'[A-Za-z0-9+/]{40,}={0,2}'),
-                ]
                 for s in strings_json:
                     string_val = s.get("string", "")
-                    if any(p.search(string_val) for p in ioc_patterns):
+                    if is_ioc(string_val) or _ELF_PATH_RE.search(string_val):
                         result["high_value_strings"].append(string_val)
 
             # Decompile entry point
@@ -95,18 +116,14 @@ class ELFExtractor:
                 decomp = r2.cmdj("pdgj")
                 if decomp and isinstance(decomp, dict) and "code" in decomp:
                     code = decomp["code"]
-                    if len(code) > 2000:
-                        code = code[:2000] + "\n// [TRUNCATED]"
+                    if len(code) > MAX_DECOMPILED_CHARS:
+                        code = code[:MAX_DECOMPILED_CHARS] + "\n// [TRUNCATED]"
                     result["functions"].append({
                         "name": "entry0",
                         "decompiled_c": code,
                         "symbolic_resolved_strings": []
                     })
-            except Exception:
-                pass
-
+            except Exception as e:
+                logger.debug(f"[ELFExtractor] entry decompilation failed: {e}")
+        finally:
             r2.quit()
-        except Exception as e:
-            logger.warning(f"[ELFExtractor] r2pipe failed: {e}")
-
-        return result

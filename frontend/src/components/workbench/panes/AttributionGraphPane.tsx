@@ -1,100 +1,112 @@
-import React, { useCallback, useMemo } from 'react';
-import ReactFlow, {
-  Background, Controls, Node, Edge,
-  useNodesState, useEdgesState, ConnectionMode, Handle, Position
-} from 'reactflow';
+import { useCallback, useMemo } from 'react';
+import type { MouseEvent } from 'react';
+import ReactFlow, { Background, Controls, ConnectionMode, Handle, Position } from 'reactflow';
+import type { Edge, Node, NodeProps } from 'reactflow';
 import 'reactflow/dist/style.css';
-import { Network, Database, Code, PackageSearch, Github } from 'lucide-react';
+import { Network, Database, Code, PackageSearch } from 'lucide-react';
 import { useInvestigationStore } from '../../../store/useInvestigationStore';
+import { truncateEnd } from '../../../lib/format';
+import type { FinalReport } from '../../../types/report';
 
-const CustomSvelteNode = ({ data, selected }: any) => (
-  <div className={`px-4 py-2 shadow-md rounded-md bg-[#0f172a] border-2 transition-all 
-    ${selected ? 'border-neon-cyan shadow-[0_0_15px_rgba(0,240,255,0.4)]' : 'border-[#334155]'} w-48`}>
-    <Handle type="target" position={Position.Top} className="w-2 h-2 !bg-neon-cyan" />
-    <div className="flex items-center space-x-2">
-      <div className={`p-1.5 rounded-full ${data.iconColor || 'bg-slate-700 text-slate-300'}`}>{data.icon}</div>
-      <div className="flex flex-col">
-        <span className="font-bold text-xs tracking-wider text-slate-100 font-mono truncate">{data.label}</span>
-        <span className="text-[9px] text-slate-400 uppercase">{data.subLabel}</span>
+type NodeKind = 'root' | 'library' | 'artifact';
+
+interface IndicatorNodeData {
+  label: string;
+  subLabel: string;
+  kind: NodeKind;
+  /** Untruncated value, used to cross-highlight other panes. */
+  fullValue?: string;
+}
+
+const MAX_ARTIFACT_NODES = 6;
+const NODE_SPACING_X = 210;
+
+const KIND_STYLE: Record<NodeKind, string> = {
+  root: 'bg-red-900/50 text-neon-red ring-1 ring-red-500/50',
+  library: 'bg-purple-900/50 text-neon-purple ring-1 ring-purple-500/50',
+  artifact: 'bg-yellow-900/50 text-neon-yellow ring-1 ring-yellow-500/50',
+};
+
+function KindIcon({ kind }: { kind: NodeKind }) {
+  if (kind === 'root') return <Code size={12} />;
+  if (kind === 'library') return <PackageSearch size={12} />;
+  return <Database size={12} />;
+}
+
+function IndicatorNode({ data, selected }: NodeProps<IndicatorNodeData>) {
+  return (
+    <div
+      className={`px-4 py-2 shadow-md rounded-md bg-[#0f172a] border-2 transition-all
+      ${selected ? 'border-neon-cyan shadow-[0_0_15px_rgba(0,240,255,0.4)]' : 'border-[#334155]'} w-48`}
+      title={data.fullValue ?? data.label}
+    >
+      <Handle type="target" position={Position.Top} className="w-2 h-2 !bg-neon-cyan" />
+      <div className="flex items-center space-x-2">
+        <div className={`p-1.5 rounded-full ${KIND_STYLE[data.kind]}`}><KindIcon kind={data.kind} /></div>
+        <div className="flex flex-col min-w-0">
+          <span className="font-bold text-xs tracking-wider text-slate-100 font-mono truncate">{data.label}</span>
+          <span className="text-[9px] text-slate-400 uppercase">{data.subLabel}</span>
+        </div>
       </div>
+      <Handle type="source" position={Position.Bottom} className="w-2 h-2 !bg-neon-cyan" />
     </div>
-    <Handle type="source" position={Position.Bottom} className="w-2 h-2 !bg-neon-cyan" />
-  </div>
-);
+  );
+}
 
-const STATIC_NODES: Node[] = [
-  { id: '1', type: 'custom', position: { x: 250, y: 50 }, data: { label: 'malware_variant_a.exe', subLabel: 'Binary (Root)', icon: <Code size={12}/>, iconColor: 'bg-red-900/50 text-neon-red ring-1 ring-red-500/50' } },
-  { id: '2', type: 'custom', position: { x: 250, y: 150 }, data: { label: 'lib_crypto_ext.dll', subLabel: 'Suspect Import', icon: <Database size={12}/>, iconColor: 'bg-yellow-900/50 text-neon-yellow ring-1 ring-yellow-500/50' } },
-  { id: '3', type: 'custom', position: { x: 100, y: 250 }, data: { label: 'crypto-js-hijacked', subLabel: 'npm package', icon: <PackageSearch size={12}/>, iconColor: 'bg-purple-900/50 text-neon-purple ring-1 ring-purple-500/50' } },
-  { id: '4', type: 'custom', position: { x: 400, y: 250 }, data: { label: 'pypi_stealer_module', subLabel: 'pip package', icon: <PackageSearch size={12}/>, iconColor: 'bg-purple-900/50 text-neon-purple ring-1 ring-purple-500/50' } },
-  { id: '5', type: 'custom', position: { x: 250, y: 350 }, data: { label: 'github.com/badactor/repo', subLabel: 'Upstream Repo', icon: <Github size={12}/>, iconColor: 'bg-slate-800 text-text-primary ring-1 ring-slate-500' } },
-];
-const STATIC_EDGES: Edge[] = [
-  { id: 'e1-2', source: '1', target: '2', animated: true, style: { stroke: '#00f0ff', strokeWidth: 2 } },
-  { id: 'e2-3', source: '2', target: '3', animated: true, style: { stroke: '#334155', strokeWidth: 2 }, label: 'Dependency' },
-  { id: 'e2-4', source: '2', target: '4', animated: true, style: { stroke: '#fbbf24', strokeWidth: 2 }, label: 'Dependency' },
-  { id: 'e3-5', source: '3', target: '5', style: { stroke: '#ff003c', strokeWidth: 2, strokeDasharray: '5 5' }, label: 'Source (Malicious)' },
-  { id: 'e4-5', source: '4', target: '5', style: { stroke: '#ff003c', strokeWidth: 2, strokeDasharray: '5 5' }, label: 'Source (Malicious)' },
-];
+const nodeTypes = { indicator: IndicatorNode };
 
-function buildGraphFromReport(report: any): { nodes: Node[]; edges: Edge[] } {
-  const prov = report?.features?.provenance;
-  const meta = report?.features?.metadata;
-  if (!prov || !meta) return { nodes: STATIC_NODES, edges: STATIC_EDGES };
-
-  const nodes: Node[] = [];
+/** Build sample → matched library → injected artifacts from the report. */
+function buildGraph(report: FinalReport): { nodes: Node<IndicatorNodeData>[]; edges: Edge[] } {
+  const { metadata, provenance, file_type: fileType } = report.features;
+  const { attribution } = report.intelligence;
+  const nodes: Node<IndicatorNodeData>[] = [];
   const edges: Edge[] = [];
-  const filename = meta.filename || 'unknown.exe';
 
-  // Root binary node
-  nodes.push({ id: 'root', type: 'custom', position: { x: 250, y: 30 },
-    data: { label: filename, subLabel: 'Binary (Root)', icon: <Code size={12}/>, iconColor: 'bg-red-900/50 text-neon-red ring-1 ring-red-500/50' }
+  const artifacts = (provenance.injected_artifacts ?? []).slice(0, MAX_ARTIFACT_NODES);
+  const rowWidth = Math.max(artifacts.length - 1, 0) * NODE_SPACING_X;
+  const centerX = rowWidth / 2;
+
+  nodes.push({
+    id: 'root', type: 'indicator', position: { x: centerX, y: 0 },
+    data: { label: truncateEnd(metadata.filename, 22), subLabel: `Sample (${fileType})`, kind: 'root', fullValue: metadata.filename },
   });
 
-  // Ecosystem match node
-  const ecoMatch = prov.ecosystem_match || 'Unknown';
-  if (ecoMatch !== 'None') {
-    nodes.push({ id: 'eco', type: 'custom', position: { x: 250, y: 150 },
-      data: { label: ecoMatch.split('(')[0].trim(), subLabel: 'Matched Library', icon: <PackageSearch size={12}/>, iconColor: 'bg-purple-900/50 text-neon-purple ring-1 ring-purple-500/50' }
+  const library = attribution.suspected_package;
+  if (library) {
+    nodes.push({
+      id: 'library', type: 'indicator', position: { x: centerX, y: 120 },
+      data: { label: truncateEnd(library, 22), subLabel: `${attribution.ecosystem} · matched library`, kind: 'library', fullValue: provenance.ecosystem_match },
     });
-    edges.push({ id: 'e-root-eco', source: 'root', target: 'eco', animated: true, style: { stroke: '#00f0ff', strokeWidth: 2 } });
+    edges.push({ id: 'e-root-library', source: 'root', target: 'library', animated: true, style: { stroke: '#00f0ff', strokeWidth: 2 }, label: 'Resembles' });
   }
 
-  // Injected artifact nodes (max 5)
-  const artifacts = (prov.injected_artifacts || []).slice(0, 5);
-  artifacts.forEach((art: string, i: number) => {
-    const id = `art-${i}`;
-    const label = art.length > 30 ? art.slice(0, 30) + '...' : art;
-    nodes.push({ id, type: 'custom', position: { x: 80 + i * 120, y: 280 },
-      data: { label, subLabel: 'Injected Artifact', icon: <Database size={12}/>, iconColor: 'bg-yellow-900/50 text-neon-yellow ring-1 ring-yellow-500/50' }
+  artifacts.forEach((artifact, i) => {
+    const id = `artifact-${i}`;
+    nodes.push({
+      id, type: 'indicator', position: { x: i * NODE_SPACING_X, y: library ? 250 : 130 },
+      data: { label: truncateEnd(artifact, 22), subLabel: library ? 'Injected artifact' : 'Extracted artifact', kind: 'artifact', fullValue: artifact },
     });
-    edges.push({ id: `e-eco-${id}`, source: ecoMatch !== 'None' ? 'eco' : 'root', target: id, animated: true,
-      style: { stroke: '#ff003c', strokeWidth: 2, strokeDasharray: '5 5' }, label: 'Delta' });
+    edges.push({
+      id: `e-${id}`, source: library ? 'library' : 'root', target: id, animated: true,
+      style: { stroke: '#ff003c', strokeWidth: 2, strokeDasharray: '5 5' }, label: library ? 'Delta' : undefined,
+    });
   });
 
   return { nodes, edges };
 }
 
 export function AttributionGraphPane() {
-  const { finalReport, setSelectedGraphNodeId } = useInvestigationStore();
+  const report = useInvestigationStore((state) => state.finalReport);
+  const setSelectedIndicator = useInvestigationStore((state) => state.setSelectedIndicator);
 
-  const { graphNodes, graphEdges } = useMemo(() => {
-    if (finalReport) {
-      const { nodes, edges } = buildGraphFromReport(finalReport);
-      return { graphNodes: nodes, graphEdges: edges };
-    }
-    return { graphNodes: STATIC_NODES, graphEdges: STATIC_EDGES };
-  }, [finalReport]);
+  const graph = useMemo(() => (report ? buildGraph(report) : null), [report]);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(graphNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(graphEdges);
-  const nodeTypes = useMemo(() => ({ custom: CustomSvelteNode }), []);
+  const onNodeClick = useCallback((_: MouseEvent, node: Node<IndicatorNodeData>) => {
+    setSelectedIndicator(node.data.kind === 'artifact' ? node.data.fullValue ?? null : null);
+  }, [setSelectedIndicator]);
+  const onPaneClick = useCallback(() => { setSelectedIndicator(null); }, [setSelectedIndicator]);
 
-  // Sync when finalReport changes
-  React.useEffect(() => { setNodes(graphNodes); setEdges(graphEdges); }, [graphNodes, graphEdges, setNodes, setEdges]);
-
-  const onNodeClick = useCallback((_: any, node: Node) => { setSelectedGraphNodeId(node.id); }, [setSelectedGraphNodeId]);
-  const onPaneClick = useCallback(() => { setSelectedGraphNodeId(null); }, [setSelectedGraphNodeId]);
+  const hidden = report ? (report.features.provenance.injected_artifacts?.length ?? 0) - MAX_ARTIFACT_NODES : 0;
 
   return (
     <div className="h-full flex flex-col bg-surface border-border overflow-hidden">
@@ -103,15 +115,29 @@ export function AttributionGraphPane() {
           <Network className="w-4 h-4 text-neon-cyan" />
           <span>Supply Chain Attribution Graph</span>
         </div>
+        {hidden > 0 && <span className="normal-case text-text-muted">+{hidden} more artifact(s) in the report</span>}
       </div>
       <div className="flex-1 relative bg-[#020617]">
         <div className="absolute inset-0 pointer-events-none bg-cyber-grid opacity-30 z-0 mix-blend-screen" />
-        <ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
-          onNodeClick={onNodeClick} onPaneClick={onPaneClick} nodeTypes={nodeTypes}
-          connectionMode={ConnectionMode.Loose} fitView className="z-10">
-          <Background color="#1e293b" gap={16} size={1} />
-          <Controls className="bg-[#0f172a] border-[#334155] fill-slate-300" style={{ display: 'flex', flexDirection: 'column' }} />
-        </ReactFlow>
+        {graph && (
+          <ReactFlow
+            // Uncontrolled: remount when the analysed sample changes.
+            key={report?.features.metadata.sha256 ?? report?.features.metadata.filename}
+            defaultNodes={graph.nodes}
+            defaultEdges={graph.edges}
+            onNodeClick={onNodeClick}
+            onPaneClick={onPaneClick}
+            nodeTypes={nodeTypes}
+            connectionMode={ConnectionMode.Loose}
+            nodesConnectable={false}
+            fitView
+            fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+            className="z-10"
+          >
+            <Background color="#1e293b" gap={16} size={1} />
+            <Controls showInteractive={false} className="bg-[#0f172a] border-[#334155] fill-slate-300" style={{ display: 'flex', flexDirection: 'column' }} />
+          </ReactFlow>
+        )}
       </div>
     </div>
   );

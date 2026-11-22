@@ -1,93 +1,89 @@
-import React, { useState } from 'react';
+import { useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import { Terminal, Copy, DownloadCloud, CheckCircle2 } from 'lucide-react';
 import { cn } from '../../../lib/utils';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useInvestigationStore } from '../../../store/useInvestigationStore';
+import { copyText, downloadText } from '../../../lib/browser';
 
-const FALLBACK_YARA = `rule origintrace_supply_chain_implant : Suspicious
-{
-    meta:
-        description = "Detects dynamic resolution and injection via suspect imported library"
-        author = "OriginTrace AI Agent"
-        date = "2026-04-19"
-        score = 85
-        hash = "8f434346648f6b96e448b111...722f"
+type RuleKind = 'yara' | 'sigma';
 
-    strings:
-        $s1 = "crypto-js-hijacked" ascii wide nocase
-        $hex1 = { 4D 5A 90 00 03 00 00 00 ... 50 45 00 00 }
-        $api1 = "VirtualAllocEx" ascii
-        $api2 = "CreateRemoteThread" ascii
+// Rule text embeds strings taken from the analysed (hostile) sample, so it is
+// highlighted by building React nodes — never by injecting HTML.
+const YARA_TOKENS = /(?<string>"(?:[^"\\\n]|\\.)*")|(?<variable>\$\w*\*?)|(?<keyword>\b(?:rule|meta|strings|condition|import|and|or|not|any|all|of|them|filesize|ascii|wide|nocase|true|false|uint16|uint32)\b)|(?<number>\b0x[0-9a-fA-F]+\b|\b\d+\b)/g;
+const SIGMA_TOKENS = /(?<keyword>^[ \t-]*[\w|.-]+:)|(?<string>'(?:[^'\n]|'')*')/gm;
 
-    condition:
-        uint16(0) == 0x5a4d and
-        filesize < 5000KB and
-        $s1 and
-        all of ($api*) and
-        math.entropy(0, filesize) >= 7.5
-}`;
+const TOKEN_CLASS: Record<string, string> = {
+  string: 'text-neon-yellow',
+  variable: 'text-neon-green',
+  keyword: 'text-neon-purple font-bold',
+  number: 'text-neon-cyan',
+};
 
-const FALLBACK_SIGMA = `title: Suspicious Process Injection via Supply Chain Implant
-id: a1b2c3d4-e5f6-7890-1234-567890abcdef
-status: experimental
-description: Detects process injection behaviors originating from a known hijacked library path.
-author: OriginTrace AI Agent
-date: 2026/04/19
-logsource:
-    category: process_creation
-    product: windows
-detection:
-    selection:
-        EventID: 10
-        TargetImage|endswith: '\\lsass.exe'
-        SourceImage|endswith: '\\malware_variant_a.exe'
-        CallTrace|contains: 'crypto-js-hijacked'
-    condition: selection
-level: high
-tags:
-    - attack.privilege_escalation
-    - attack.t1055
-`;
+function highlight(text: string, kind: RuleKind): ReactNode[] {
+  const pattern = kind === 'yara' ? YARA_TOKENS : SIGMA_TOKENS;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+
+  for (const match of text.matchAll(pattern)) {
+    const start = match.index ?? 0;
+    if (start > cursor) nodes.push(text.slice(cursor, start));
+    const tokenType = Object.entries(match.groups ?? {}).find(([, value]) => value !== undefined)?.[0] ?? 'string';
+    nodes.push(<span key={start} className={TOKEN_CLASS[tokenType]}>{match[0]}</span>);
+    cursor = start + match[0].length;
+  }
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes;
+}
 
 export function DetectionEngineeringPane() {
-  const [activeTab, setActiveTab] = useState<'yara' | 'sigma'>('yara');
+  const [activeTab, setActiveTab] = useState<RuleKind>('yara');
   const [copied, setCopied] = useState(false);
-  const { finalReport } = useInvestigationStore();
+  const report = useInvestigationStore((state) => state.finalReport);
 
-  // Wire to live data from the store; fall back to hardcoded constants when no report is available
-  const yaraRule = finalReport?.detections?.yara_rule || FALLBACK_YARA;
-  const sigmaRule = finalReport?.detections?.sigma_rule || FALLBACK_SIGMA;
-
+  const yaraRule = report?.detections.yara_rule ?? '';
+  const sigmaRule = report?.detections.sigma_rule ?? '';
   const activeContent = activeTab === 'yara' ? yaraRule : sigmaRule;
+  const highlighted = useMemo(() => highlight(activeContent, activeTab), [activeContent, activeTab]);
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(activeContent).catch(() => {});
+  const handleCopy = async () => {
+    if (!activeContent || !(await copyText(activeContent))) return;
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
+
+  const handleDownload = () => {
+    if (!report || !activeContent) return;
+    const { sha256, filename } = report.features.metadata;
+    const stem = (sha256 ?? filename).slice(0, 16);
+    if (activeTab === 'yara') downloadText(`${stem}.yar`, activeContent);
+    else downloadText(`${stem}.yml`, activeContent, 'text/yaml');
+  };
+
+  const tabClass = (tab: RuleKind) => cn(
+    "px-4 py-2 text-xs font-semibold uppercase tracking-wider flex items-center border-r border-border transition-colors outline-none",
+    activeTab === tab ? "bg-[#0f172a] text-neon-cyan shadow-[inset_0_-2px_0_0_#00f0ff]" : "bg-transparent hover:bg-surface text-text-muted"
+  );
 
   return (
     <div className="h-full flex flex-col bg-surface overflow-hidden border-t border-border/50">
       <div className="pane-header !p-0 pr-2 flex items-center justify-between bg-surface-highlight border-b border-border/70">
         <div className="flex">
-          <button 
-            className={cn("px-4 py-2 text-xs font-semibold uppercase tracking-wider flex items-center border-r border-border transition-colors outline-none", activeTab === 'yara' ? "bg-[#0f172a] text-neon-cyan shadow-[inset_0_-2px_0_0_#00f0ff]" : "bg-transparent hover:bg-surface text-text-muted")}
-            onClick={() => setActiveTab('yara')}
-          >
+          <button className={tabClass('yara')} onClick={() => setActiveTab('yara')}>
             <Terminal className="w-4 h-4 mr-2" />
             YARA
           </button>
-          <button 
-            className={cn("px-4 py-2 text-xs font-semibold uppercase tracking-wider flex items-center border-r border-border transition-colors outline-none", activeTab === 'sigma' ? "bg-[#0f172a] text-neon-cyan shadow-[inset_0_-2px_0_0_#00f0ff]" : "bg-transparent hover:bg-surface text-text-muted")}
-            onClick={() => setActiveTab('sigma')}
-          >
+          <button className={tabClass('sigma')} onClick={() => setActiveTab('sigma')}>
             <Terminal className="w-4 h-4 mr-2" />
             Sigma
           </button>
         </div>
 
-        <div className="flex space-x-2">
-          <button onClick={handleCopy} className="flex items-center px-3 py-1 bg-background hover:bg-surface-highlight border border-border rounded text-[10px] text-text-secondary transition-colors group relative">
+        <div className="flex items-center space-x-2 pr-2">
+          {report && (
+            <span className="text-[10px] text-text-muted normal-case hidden md:inline">engine: {report.detections.engine}</span>
+          )}
+          <button onClick={handleCopy} disabled={!activeContent} className="flex items-center px-3 py-1 bg-background hover:bg-surface-highlight border border-border rounded text-[10px] text-text-secondary transition-colors group relative disabled:opacity-40">
             <AnimatePresence mode="wait">
               {copied ? (
                 <motion.div key="check" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }}>
@@ -101,34 +97,24 @@ export function DetectionEngineeringPane() {
             </AnimatePresence>
             <span className="ml-1 uppercase tracking-widest">{copied ? 'Copied' : 'Copy'}</span>
           </button>
-          
-          <button className="flex items-center px-3 py-1 bg-background hover:bg-surface-highlight border border-border rounded text-[10px] text-text-secondary transition-colors group">
+
+          <button onClick={handleDownload} disabled={!activeContent} className="flex items-center px-3 py-1 bg-background hover:bg-surface-highlight border border-border rounded text-[10px] text-text-secondary transition-colors group disabled:opacity-40">
             <DownloadCloud className="w-3 h-3 group-hover:text-neon-cyan transition-colors" />
-            <span className="ml-1 uppercase tracking-widest">SIEM</span>
+            <span className="ml-1 uppercase tracking-widest">Download</span>
           </button>
         </div>
       </div>
 
       <div className="flex-1 overflow-auto bg-[#090e17] p-4 relative group custom-scrollbar">
-        {/* Synthetic code block highlights. Real world would use Prism/Highlight.js */}
-        <pre className="font-mono text-sm leading-relaxed text-text-primary/90">
-          <code className="block whitespace-pre-wrap selection:bg-neon-cyan/30 selection:text-white">
-            {activeTab === 'yara' && (
-              <span dangerouslySetInnerHTML={{ __html: yaraRule
-                .replace(/(rule|meta:|strings:|condition:|and|all of|filesize|\$s1|\$hex1|\$api1|\$api2)/g, '<span class="text-neon-purple font-bold">$1</span>')
-                .replace(/(".*?")/g, '<span class="text-neon-yellow">$1</span>')
-                .replace(/(0x[0-9a-fA-F]+|\d+)/g, '<span class="text-neon-cyan">$1</span>') 
-              }} />
-            )}
-            
-            {activeTab === 'sigma' && (
-              <span dangerouslySetInnerHTML={{ __html: sigmaRule
-                .replace(/(title:|id:|status:|description:|author:|date:|logsource:|category:|product:|detection:|selection:|condition:|level:|tags:)/g, '<span class="text-neon-purple font-bold">$1</span>')
-                .replace(/('.*?')/g, '<span class="text-neon-yellow">$1</span>')
-              }} />
-            )}
-          </code>
-        </pre>
+        {activeContent ? (
+          <pre className="font-mono text-sm leading-relaxed text-text-primary/90">
+            <code className="block whitespace-pre-wrap break-words selection:bg-neon-cyan/30 selection:text-white">
+              {highlighted}
+            </code>
+          </pre>
+        ) : (
+          <div className="h-full flex items-center justify-center text-sm text-text-muted">No detection rule available.</div>
+        )}
       </div>
     </div>
   );

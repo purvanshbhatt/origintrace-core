@@ -1,31 +1,17 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { UploadCloud, FileCode, ShieldAlert, Cpu, CheckCircle2, Copy, AlertCircle, ShieldBan, Terminal, Network } from 'lucide-react';
+import { UploadCloud, ShieldAlert, Cpu, CheckCircle2, Copy, AlertCircle, ShieldBan, Terminal, Network } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ThreatGraph } from './ThreatGraph';
+import { analyzeFile } from '../lib/analyzeStream';
+import { copyText } from '../lib/browser';
+import type { FinalReport } from '../types/report';
 
 // --- Type Definitions for the Dashboard State ---
 type AnalysisState = 'idle' | 'analyzing' | 'complete' | 'error';
 
-interface FinalReport {
-  features: any;
-  intelligence: {
-    threat_level: string;
-    behavioral_summary: string;
-    mitre_mapping: Array<{ tactic: string; technique_id: string; evidence: string }>;
-    attribution: {
-      ecosystem: string;
-      suspected_package?: string;
-    };
-  };
-  detections: {
-    yara_rule: string;
-    sigma_rule: string;
-  };
-}
-
 export function AnalysisDashboard() {
   const [status, setStatus] = useState<AnalysisState>('idle');
-  const [messages, setMessages] = useState<{ id: number; text: string }[]>([]);
+  const [messages, setMessages] = useState<string[]>([]);
   const [report, setReport] = useState<FinalReport | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>('');
   
@@ -47,62 +33,20 @@ export function AnalysisDashboard() {
   // --- 1. Fetch Logic & SSE Parsing ---
   const handleFileUpload = async (file: File) => {
     setStatus('analyzing');
-    setMessages([{ id: Date.now(), text: `[SYSTEM] Uploading ${file.name} for Autonomous Semantic Provenance...` }]);
+    setMessages([`[SYSTEM] Uploading ${file.name} for Autonomous Semantic Provenance...`]);
     setReport(null);
     setErrorMsg('');
 
-    const formData = new FormData();
-    formData.append('file', file);
-
     try {
-      const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
-      const response = await fetch(`${API_BASE}/api/v1/analyze`, {
-        method: 'POST',
-        body: formData,
+      // analyzeFile buffers the SSE stream and rejects on error events or a
+      // stream that ends early, so the dashboard can never hang in "analyzing".
+      const result = await analyzeFile(file, {
+        onStatus: (agent, message) => setMessages(prev => [...prev, `[${agent}] ${message}`]),
       });
-
-      if (!response.ok) throw new Error(`Server returned status: ${response.status}`);
-      if (!response.body) throw new Error('ReadableStream not supported.');
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-
-      let stepCounter = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.trim() === '') continue;
-
-          if (line.startsWith('data: ')) {
-            try {
-              const payload = JSON.parse(line.substring(6));
-              
-              if (payload.type === 'status') {
-                setMessages(prev => [...prev, { 
-                  id: Date.now() + stepCounter++, 
-                  text: `[${payload.agent}] ${payload.message}` 
-                }]);
-              } else if (payload.type === 'complete') {
-                setReport(payload.data);
-                setStatus('complete');
-              } else if (payload.type === 'error') {
-                throw new Error(payload.message);
-              }
-            } catch (err) {
-              console.error("SSE Parse Error:", err);
-            }
-          }
-        }
-      }
-    } catch (err: any) {
-      console.error(err);
-      setErrorMsg(err.message || 'Stream connection failed.');
+      setReport(result);
+      setStatus('complete');
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Stream connection failed.');
       setStatus('error');
     }
   };
@@ -124,8 +68,8 @@ export function AnalysisDashboard() {
   };
 
   // --- Helpers ---
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text);
+  const handleCopy = async (text: string) => {
+    if (!(await copyText(text))) return;
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -188,13 +132,13 @@ export function AnalysisDashboard() {
                 <span className="text-xs font-mono text-gray-400 uppercase">Engine Live Stream</span>
               </div>
               <div className="p-6 h-96 overflow-y-auto font-mono text-sm leading-relaxed custom-scrollbar">
-                {messages.map((msg, i) => (
-                  <motion.div 
-                    key={msg.id} 
+                {messages.map((text, i) => (
+                  <motion.div
+                    key={i}
                     initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }}
                     className="mb-2 text-gray-300"
                   >
-                    <span className="text-cyan-500 mr-2">{'>'}</span>{msg.text}
+                    <span className="text-cyan-500 mr-2">{'>'}</span>{text}
                   </motion.div>
                 ))}
                 <div className="flex items-center mt-4">
@@ -256,6 +200,13 @@ export function AnalysisDashboard() {
                     {report.intelligence.behavioral_summary}
                   </p>
                 </div>
+
+                <button
+                  onClick={() => setStatus('idle')}
+                  className="w-full px-4 py-2 bg-gray-900 hover:bg-gray-800 text-gray-300 rounded text-sm transition-colors border border-gray-800"
+                >
+                  Analyze another file
+                </button>
               </div>
 
               {/* Right Column */}
@@ -310,8 +261,8 @@ export function AnalysisDashboard() {
                       <Network className="w-4 h-4 mr-2" />
                       Threat Graph
                     </button>
-                    <div className="ml-auto flex items-center pr-4">
-                      <button 
+                    <div className={`ml-auto flex items-center pr-4 ${activeTab === 'graph' ? 'invisible' : ''}`}>
+                      <button
                         onClick={() => handleCopy(activeTab === 'yara' ? report.detections.yara_rule : report.detections.sigma_rule)}
                         className="text-gray-500 hover:text-white transition-colors flex items-center text-xs uppercase tracking-wider font-bold bg-gray-800 px-3 py-1.5 rounded"
                       >

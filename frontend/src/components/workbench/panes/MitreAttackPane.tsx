@@ -1,127 +1,80 @@
-import React, { useMemo } from 'react';
+import { useMemo } from 'react';
 import { Target } from 'lucide-react';
 import { useInvestigationStore } from '../../../store/useInvestigationStore';
 import { cn } from '../../../lib/utils';
-
-interface AttackTechnique {
-  id: string;
-  name: string;
-  tactic: string;
-  evidence: string;
-  confidence: 'High' | 'Medium' | 'Low';
-}
-
-const FALLBACK_DATA: AttackTechnique[] = [
-  { id: 'T1059', name: 'Command and Scripting Interpreter', tactic: 'Execution', evidence: 'Cmd.exe spawned with suspicious encoded Base64 parameters.', confidence: 'High' },
-  { id: 'T1055', name: 'Process Injection', tactic: 'Privilege Escalation', evidence: 'CreateRemoteThread discovered targeting lsass.exe', confidence: 'High' },
-  { id: 'T1082', name: 'System Information Discovery', tactic: 'Discovery', evidence: 'Registry queries to HKLM\\Software\\Microsoft\\Cryptography', confidence: 'Medium' },
-  { id: 'T1140', name: 'Deobfuscate/Decode Files or Information', tactic: 'Defense Evasion', evidence: 'Custom XOR decoding loop found in suspect import crypto-js-hijacked.', confidence: 'High' },
-  { id: 'T1571', name: 'Non-Standard Port', tactic: 'Command and Control', evidence: 'Outbound TCP connection attempted on port 13337.', confidence: 'Low' },
-  { id: 'T1566', name: 'Phishing', tactic: 'Initial Access', evidence: '-', confidence: 'Low' },
-  { id: 'T1190', name: 'Exploit Public-Facing Application', tactic: 'Initial Access', evidence: '-', confidence: 'Low' },
-];
+import type { MitreTechnique } from '../../../types/report';
 
 export function MitreAttackPane() {
-  const { selectedGraphNodeId, finalReport } = useInvestigationStore();
+  const report = useInvestigationStore((state) => state.finalReport);
+  const selectedIndicator = useInvestigationStore((state) => state.selectedIndicator);
 
-  // Wire to live data from the store; fall back to mock data when no report is available
-  const mtcData: AttackTechnique[] = useMemo(() => {
-    const liveMapping = finalReport?.intelligence?.mitre_mapping;
-    if (!liveMapping || liveMapping.length === 0) return FALLBACK_DATA;
-    
-    return liveMapping.map((ttp: any) => ({
-      id: ttp.technique_id || ttp.id || 'N/A',
-      name: ttp.technique_id || 'Unknown Technique',
-      tactic: ttp.tactic || 'Unknown',
-      evidence: ttp.evidence || ttp.ai_evidence || '-',
-      confidence: inferConfidence(ttp.evidence || ttp.ai_evidence || ''),
-    }));
-  }, [finalReport]);
+  const techniques = useMemo<MitreTechnique[]>(() => report?.intelligence.mitre_mapping ?? [], [report]);
 
-  const getConfidenceColor = (conf: string) => {
-    switch(conf) {
-      case 'High': return 'border-neon-red/50 bg-red-900/10 text-neon-red shadow-[inset_0_0_10px_rgba(255,0,60,0.1)] glow-text-red';
-      case 'Medium': return 'border-neon-yellow/50 bg-yellow-900/10 text-neon-yellow';
-      default: return 'border-border/30 bg-surface/50 text-text-muted opacity-50';
-    }
-  };
-
-  // Group by Tactic
+  // Group by Tactic, preserving the order the backend reports them in
   const grouped = useMemo(() => {
-    return mtcData.reduce((acc, curr) => {
-      if (!acc[curr.tactic]) acc[curr.tactic] = [];
-      acc[curr.tactic].push(curr);
+    return techniques.reduce((acc, curr) => {
+      const tactic = curr.tactic || 'Unknown';
+      if (!acc[tactic]) acc[tactic] = [];
+      acc[tactic].push(curr);
       return acc;
-    }, {} as Record<string, AttackTechnique[]>);
-  }, [mtcData]);
+    }, {} as Record<string, MitreTechnique[]>);
+  }, [techniques]);
 
-  const highlightedTactic = selectedGraphNodeId === '3' ? 'Defense Evasion' : null;
+  // Cross-highlight: techniques whose evidence cites the artifact selected in the graph.
+  const isCited = (technique: MitreTechnique) =>
+    selectedIndicator !== null && technique.evidence.includes(selectedIndicator);
+  const anyCited = techniques.some(isCited);
 
   return (
     <div className="h-full flex flex-col bg-surface overflow-hidden">
-      <div className="pane-header flex items-center">
+      <div className="pane-header flex items-center !justify-start">
         <Target className="w-4 h-4 mr-2" />
-        MITRE ATT&CK Matrix {selectedGraphNodeId === '3' && <span className="ml-2 text-neon-purple lowercase animate-pulse">- filtering by selected node</span>}
+        MITRE ATT&CK Matrix
+        {anyCited && <span className="ml-2 text-neon-purple normal-case">— citing the selected artifact</span>}
       </div>
 
       <div className="flex-1 overflow-x-auto overflow-y-auto custom-scrollbar p-4">
-        <div className="flex space-x-2 min-w-max">
-          {Object.entries(grouped).map(([tactic, techniques]) => {
-            const isHighlightedTactic = highlightedTactic === tactic;
-
-            return (
-              <div key={tactic} className={cn(
-                "w-48 shrink-0 flex flex-col transition-opacity", 
-                highlightedTactic && !isHighlightedTactic ? "opacity-30" : "opacity-100"
-              )}>
+        {techniques.length === 0 ? (
+          <div className="h-full flex items-center justify-center text-sm text-text-muted text-center px-6">
+            No ATT&CK techniques were mapped for this sample.
+          </div>
+        ) : (
+          <div className="flex space-x-2 min-w-max">
+            {Object.entries(grouped).map(([tactic, tacticTechniques]) => (
+              <div key={tactic} className="w-56 shrink-0 flex flex-col">
                 <div className="text-[10px] font-bold uppercase tracking-wider text-text-secondary bg-surface-highlight py-1.5 px-2 mb-2 rounded border border-border/50 truncate" title={tactic}>
                   {tactic}
                 </div>
                 <div className="flex flex-col space-y-2">
-                  {techniques.map(tech => (
-                    <div 
-                      key={tech.id}
+                  {tacticTechniques.map((tech) => (
+                    <div
+                      key={`${tech.technique_id}-${tech.evidence}`}
                       className={cn(
-                        "group relative p-2 border rounded text-xs cursor-crosshair transition-all duration-200",
-                        getConfidenceColor(tech.confidence),
-                        tech.confidence !== 'Low' && "hover:bg-surface-highlight hover:-translate-y-0.5"
+                        "p-2 border rounded text-xs transition-all duration-200 border-neon-red/40 bg-red-900/10",
+                        anyCited && !isCited(tech) && "opacity-30",
+                        isCited(tech) && "border-neon-purple shadow-[0_0_10px_rgba(177,66,245,0.3)]"
                       )}
                     >
-                      <div className="font-mono text-[10px] mb-1 opacity-80">{tech.id}</div>
-                      <div className="font-semibold leading-tight">{tech.name}</div>
-                      
-                      {/* Hover Popover containing AI Evidence */}
-                      {tech.confidence !== 'Low' && (
-                        <div className="absolute top-1/2 left-full -translate-y-1/2 ml-2 w-64 bg-background border border-neon-cyan/50 rounded shadow-2xl z-50 p-3 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all pointer-events-none">
-                          <div className="text-[9px] uppercase font-bold text-neon-cyan mb-1 tracking-widest">AI Evidence</div>
-                          <div className="text-xs text-text-primary font-mono whitespace-pre-wrap leading-relaxed">{tech.evidence}</div>
-                        </div>
-                      )}
+                      <div className="font-mono text-[10px] mb-1 text-neon-red/90">{tech.technique_id}</div>
+                      <div className="font-semibold leading-tight text-text-primary">{tech.technique_name || tech.technique_id}</div>
+                      <div className="mt-2 text-[11px] text-text-secondary font-mono leading-relaxed break-words whitespace-pre-wrap">
+                        {tech.evidence}
+                      </div>
                     </div>
                   ))}
                 </div>
               </div>
-            );
-          })}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
-      
-      {/* Legend */}
-      <div className="h-6 shrink-0 bg-surface-highlight flex flex-row items-center px-4 space-x-4 border-t border-border">
-         <span className="text-[9px] text-text-muted uppercase font-bold tracking-widest">Confidence:</span>
-         <div className="flex items-center space-x-1"><div className="w-2 h-2 rounded-full bg-neon-red shadow-[0_0_5px_#ff003c]"></div><span className="text-[10px] text-text-secondary">High</span></div>
-         <div className="flex items-center space-x-1"><div className="w-2 h-2 rounded-full bg-neon-yellow"></div><span className="text-[10px] text-text-secondary">Medium</span></div>
-         <div className="flex items-center space-x-1"><div className="w-2 h-2 rounded-full bg-slate-600"></div><span className="text-[10px] text-text-secondary">Low</span></div>
+
+      <div className="h-6 shrink-0 bg-surface-highlight flex flex-row items-center px-4 border-t border-border">
+        <span className="text-[10px] text-text-muted uppercase font-bold tracking-widest">
+          {techniques.length} technique(s) · {Object.keys(grouped).length} tactic(s)
+          {report ? ` · engine: ${report.intelligence.engine}` : ''}
+        </span>
       </div>
     </div>
   );
-}
-
-/** Infer confidence from the specificity of the evidence string */
-function inferConfidence(evidence: string): 'High' | 'Medium' | 'Low' {
-  if (!evidence || evidence === '-') return 'Low';
-  // If the evidence contains a specific function name, address, or quoted string, it's high-confidence
-  if (/0x[0-9a-fA-F]+|".*?"|'.+?'|[A-Z][a-z]+[A-Z]|\.dll|\.exe/.test(evidence)) return 'High';
-  if (evidence.length > 30) return 'Medium';
-  return 'Low';
 }

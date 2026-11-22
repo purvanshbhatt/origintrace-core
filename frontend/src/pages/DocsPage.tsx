@@ -1,4 +1,3 @@
-import React from 'react';
 import { Book, Code, Layers } from 'lucide-react';
 
 export function DocsPage() {
@@ -20,14 +19,18 @@ export function DocsPage() {
             </div>
             <div className="prose prose-invert max-w-none text-gray-400">
               <p className="mb-4">
-                OriginTrace utilizes a highly asynchronous Pipeline architecture consisting of two primary stages:
+                OriginTrace runs every upload through an asynchronous three-stage pipeline:
               </p>
               <ul className="list-disc pl-6 space-y-2 mb-4">
-                <li><strong>Stage 1 (Static Extraction):</strong> Native bindings to <code className="text-cyan-300 bg-gray-900 px-1 rounded">pefile</code> and <code className="text-cyan-300 bg-gray-900 px-1 rounded">radare2</code> safely parse headers, compute Shannon entropy, and disassemble entrypoints without detonation.</li>
-                <li><strong>Stage 2 (LLM Reasoning):</strong> Extracted context is pushed via Pydantic schemas into Google Gemini 3.0 Flash, which deterministically generates MITRE ATT&CK mapping and custom detection rules.</li>
+                <li><strong>Stage 1 (Static Extraction):</strong> A file-type router inspects magic bytes and dispatches to a specialised extractor: <code className="text-cyan-300 bg-gray-900 px-1 rounded">pefile</code> / <code className="text-cyan-300 bg-gray-900 px-1 rounded">radare2</code> / <code className="text-cyan-300 bg-gray-900 px-1 rounded">angr</code> for binaries, AST and pattern analysis for scripts, <code className="text-cyan-300 bg-gray-900 px-1 rounded">oletools</code> for Office macros. Nothing is detonated.</li>
+                <li><strong>Stage 2 (Threat Analysis):</strong> Extracted features are mapped to MITRE ATT&CK techniques and the supply-chain delta is explained.</li>
+                <li><strong>Stage 3 (Detection Engineering):</strong> A YARA rule and a Sigma rule are generated from the injected artifacts, excluding the legitimate library baseline.</li>
               </ul>
+              <p className="mb-4">
+                Stages 2 and 3 use Google Gemini when an API key is configured, and a deterministic offline rule engine otherwise (or as a fallback if a Gemini call fails). Every report states which engine produced it.
+              </p>
               <p>
-                The frontend consumes this pipeline via Server-Sent Events (SSE) multiplexed from a FastAPI backend.
+                The frontend consumes this pipeline via Server-Sent Events (SSE) from a FastAPI backend.
               </p>
             </div>
           </section>
@@ -44,12 +47,17 @@ export function DocsPage() {
               </div>
               <div className="p-6 text-gray-400 text-sm">
                 <p className="mb-4"><strong>Content-Type:</strong> <code className="text-gray-300 bg-gray-800 px-1 rounded">multipart/form-data</code></p>
-                <p className="mb-4">Accepts a single file upload under the key <code>file</code>.</p>
-                <p className="mb-2"><strong>Response Stream (SSE):</strong></p>
+                <p className="mb-4">Accepts a single file upload under the key <code>file</code> (max 32 MB). Oversized uploads return <code>413</code>, empty ones <code>400</code>.</p>
+                <p className="mb-2"><strong>Response Stream (SSE):</strong> one JSON object per event; the stream ends with either <code>complete</code> or <code>error</code>.</p>
                 <pre className="bg-black p-4 rounded text-gray-300 font-mono text-xs overflow-x-auto">
-{`data: {"type": "status", "agent": "Extractor", "message": "Unpacking PE..."}
-data: {"type": "complete", "data": {"features": {...}, "intelligence": {...}}}`}
+{`data: {"type": "status", "agent": "Extractor", "message": "Identifying file type..."}
+
+data: {"type": "complete", "data": {"schema_version": "1.0", "mode": "heuristic",
+       "features": {...}, "intelligence": {...}, "detections": {...}, "warnings": []}}
+
+data: {"type": "error", "message": "Extraction timed out after 120s."}`}
                 </pre>
+                <p className="mt-4"><code>GET /health</code> reports the active mode and which optional analysis tools are available.</p>
               </div>
             </div>
           </section>
@@ -58,9 +66,9 @@ data: {"type": "complete", "data": {"features": {...}, "intelligence": {...}}}`}
           <section>
             <div className="flex items-center space-x-3 mb-6">
               <Book className="w-6 h-6 text-cyan-400" />
-              <h2 className="text-2xl font-bold text-white">Supported Architectures</h2>
+              <h2 className="text-2xl font-bold text-white">Supported Formats</h2>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="p-4 border border-gray-800 rounded-lg bg-gray-900/30">
                 <h4 className="font-bold text-white mb-2">Native Binaries</h4>
                 <ul className="list-disc pl-5 text-sm text-gray-400 space-y-1">
@@ -69,14 +77,24 @@ data: {"type": "complete", "data": {"features": {...}, "intelligence": {...}}}`}
                 </ul>
               </div>
               <div className="p-4 border border-gray-800 rounded-lg bg-gray-900/30">
-                <h4 className="font-bold text-white mb-2">Package Ecosystems</h4>
+                <h4 className="font-bold text-white mb-2">Scripts</h4>
                 <ul className="list-disc pl-5 text-sm text-gray-400 space-y-1">
-                  <li>Node Package Manager (.tgz, .npm)</li>
-                  <li>Python Package Index (.whl, .tar.gz)</li>
-                  <li>Raw Scripts (.py, .js, .ps1)</li>
+                  <li>Python, JavaScript (.py, .js)</li>
+                  <li>Shell, PowerShell, Batch (.sh, .ps1, .bat)</li>
+                  <li>Any other plain-text file (generic scan)</li>
+                </ul>
+              </div>
+              <div className="p-4 border border-gray-800 rounded-lg bg-gray-900/30">
+                <h4 className="font-bold text-white mb-2">Office Documents</h4>
+                <ul className="list-disc pl-5 text-sm text-gray-400 space-y-1">
+                  <li>Legacy OLE (.doc, .xls, .ppt)</li>
+                  <li>OOXML with VBA macros (.docm, .xlsm)</li>
                 </ul>
               </div>
             </div>
+            <p className="mt-4 text-sm text-gray-500">
+              Package archives (.whl, .tgz, .zip) are not unpacked yet: extract the suspect file and upload it directly.
+            </p>
           </section>
 
         </div>

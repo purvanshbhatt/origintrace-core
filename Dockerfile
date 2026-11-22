@@ -39,7 +39,11 @@ USER appuser
 # 5. Install r2ghidra locally for appuser (avoids sudo)
 RUN r2pm -U && r2pm -i r2ghidra
 
+# 6. Bake the provenance embedding model into the image so cold starts do not
+#    download it (and do not depend on Hugging Face being reachable).
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 EXPOSE 8080
 
-# 6. Run the production FastAPI server
+# 7. Run the production FastAPI server
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

@@ -28,7 +28,9 @@ steps:
       - '--set-secrets'
       - 'GEMINI_API_KEY=projects/$PROJECT_ID/secrets/GEMINI_API_KEY:latest'
       - '--set-env-vars'
-      - 'ALLOWED_ORIGINS=https://origintrace-ui.web.app,http://localhost:5173,http://localhost:8080'
+      # gcloud splits --set-env-vars on commas; the ^@^ prefix switches the
+      # delimiter to "@" so the comma-separated origin list stays one value.
+      - '^@^ALLOWED_ORIGINS=https://origintrace-ui.web.app,https://origintrace-ui.firebaseapp.com,http://localhost:5173'
 
 images:
   - 'gcr.io/$PROJECT_ID/origintrace-engine'
