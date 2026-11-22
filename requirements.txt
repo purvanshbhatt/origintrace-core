@@ -3,8 +3,16 @@ uvicorn[standard]==0.30.1
 pydantic==2.8.2
 pefile==2023.2.7
 r2pipe==1.9.0
-google-genai==1.16.0
+google-genai==1.16.1
 python-multipart==0.0.9
 faiss-cpu==1.8.0
 sentence-transformers==3.0.1
 numpy==1.26.4
+angr==9.2.125
+# angr 9.2.125 does not import with the next major of these transitive
+# dependencies (bitstring 5 dropped ConstBitStream, pycparser 3 changed CLexer).
+bitstring==4.4.0
+pycparser==2.23
+python-magic==0.4.27
+pyelftools==0.31
+oletools==0.60.2

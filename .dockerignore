@@ -1,0 +1,17 @@
+# Keep the backend image small: only the API source is needed at runtime.
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+frontend
+tests
+docs
+graphify-out
+data
+.claude
+.agent
+*.md
+mock_dropper.py
+mock_dropper.spec

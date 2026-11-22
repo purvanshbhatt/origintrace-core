@@ -1,0 +1,6 @@
+# Test tooling for the OriginTrace backend (not needed in the production image).
+pytest==9.2.0
+httpx==0.28.1
+PyYAML==6.0.3
+# Optional: lets the suite compile generated YARA rules instead of skipping.
+yara-python==4.5.4
