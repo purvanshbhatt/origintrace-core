@@ -90,19 +90,50 @@ class DocumentFeatures(BaseModel):
     high_value_strings: List[str] = Field(default_factory=list, description="IOC-grade strings from macro code")
 
 
+class ArchiveMember(BaseModel):
+    """Summary of one file analysed inside a package or archive."""
+    path: str = Field(description="Member path inside the archive")
+    size: int = Field(description="Uncompressed size in bytes")
+    sha256: str = Field(description="SHA256 of the member's content")
+    file_type: str = Field(description="Detected class of the member: pe, elf, script, document")
+    language: Optional[str] = Field(default=None, description="Script language, when the member is a script")
+    imports: List[str] = Field(default_factory=list)
+    suspicious_calls: List[str] = Field(default_factory=list)
+    high_value_strings: List[str] = Field(default_factory=list)
+    encoded_blobs: List[str] = Field(default_factory=list)
+    obfuscation_score: float = Field(default=0.0, ge=0.0, le=8.0)
+    has_macros: bool = Field(default=False)
+    source_excerpt: str = Field(default="", description="Leading source text (truncated)")
+
+
+class ArchiveFeatures(BaseModel):
+    """Features extracted from a software package or archive (wheel, sdist, npm tarball, zip, tar)."""
+    archive_type: str = Field(description="wheel, sdist, npm, zip, tar, gzip")
+    member_count: int = Field(description="Regular files listed in the archive")
+    total_uncompressed_bytes: int = Field(default=0)
+    package: Optional[Dict[str, str]] = Field(default=None, description="Identity from package metadata: ecosystem, name, version")
+    install_hooks: List[str] = Field(default_factory=list, description="Lifecycle scripts that run at install time (e.g. npm postinstall)")
+    analyzed_members: List[ArchiveMember] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list, description="Skipped members, limits hit, traversal attempts")
+    imports: List[str] = Field(default_factory=list, description="Imports across analysed members")
+    suspicious_calls: List[str] = Field(default_factory=list, description="Suspicious calls across analysed members")
+    high_value_strings: List[str] = Field(default_factory=list, description="IOC-grade strings across analysed members")
+
+
 class ExtractionResult(BaseModel):
     """
     Normalized root schema that the File Type Router produces.
-    At most one of binary_features / script_features / document_features
-    is populated, depending on the detected file type.
+    At most one of binary_features / script_features / document_features /
+    archive_features is populated, depending on the detected file type.
     """
     metadata: Dict[str, Any] = Field(description="File metadata: filename, sha256, md5, size, file_type, extension_mismatch")
-    file_type: str = Field(description="Canonical file class: pe, elf, script, document, unknown")
+    file_type: str = Field(description="Canonical file class: pe, elf, script, document, archive, unknown")
 
     # Polymorphic feature payloads — only one is populated per analysis
     binary_features: Optional[BinaryFeatures] = Field(default=None, description="Populated for PE and ELF files")
     script_features: Optional[ScriptFeatures] = Field(default=None, description="Populated for scripts and plain text")
     document_features: Optional[DocumentFeatures] = Field(default=None, description="Populated for Office documents")
+    archive_features: Optional[ArchiveFeatures] = Field(default=None, description="Populated for packages and archives")
 
     # Universal fields present regardless of file type
     provenance: Dict[str, Any] = Field(default_factory=lambda: {

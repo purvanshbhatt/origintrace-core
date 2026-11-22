@@ -10,8 +10,9 @@ import ast
 import logging
 import math
 import re
+import warnings
 from collections import Counter
-from typing import Dict, Any, List, Sequence
+from typing import Dict, Any, List, Optional, Sequence, Set
 
 from extractors.ioc import BASE64_RE, find_iocs
 
@@ -140,6 +141,8 @@ _JS_REQUIRE_RE = re.compile(r'\brequire\s*\(\s*["\']([^"\']+)["\']\s*\)')
 _JS_IMPORT_RE = re.compile(r'\bimport\s+(?:[^"\';]*?\sfrom\s+)?["\']([^"\']+)["\']')
 _JS_DYNAMIC_IMPORT_RE = re.compile(r'\bimport\s*\(\s*["\']([^"\']+)["\']\s*\)')
 _PY_IMPORT_FALLBACK_RE = re.compile(r'^\s*(?:from\s+(\S+)\s+)?import\s+(.+)', re.MULTILINE)
+_PY_DYNAMIC_CALL_NAMES = {"eval", "exec", "compile"}
+_PY_DYNAMIC_CALL_RE = re.compile(r'(eval|exec|compile)\s*\(')
 
 
 def _shannon_entropy(text: str) -> float:
@@ -201,6 +204,25 @@ def _unique(items: List[str]) -> List[str]:
     return list(dict.fromkeys(items))
 
 
+def _parse_python(source: str) -> Optional[ast.AST]:
+    """Parse Python source; None for Python 2, obfuscated or invalid code."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # hostile source triggers SyntaxWarnings
+            return ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+
+
+def _python_dynamic_calls(tree: ast.AST) -> Set[str]:
+    """Names among eval/exec/compile that the code actually calls."""
+    return {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _PY_DYNAMIC_CALL_NAMES
+    }
+
+
 class ScriptExtractor:
     """Extraction pipeline for interpreted malicious scripts."""
 
@@ -228,8 +250,9 @@ class ScriptExtractor:
         }
 
         # ── Import extraction (AST for Python, regex for JavaScript) ──
+        tree = _parse_python(source) if language == "python" else None
         if language == "python":
-            result["ast_imports"] = self._extract_python_imports(source)
+            result["ast_imports"] = self._extract_python_imports(source, tree)
         elif language == "javascript":
             result["ast_imports"] = self._extract_js_imports(source)
 
@@ -240,6 +263,14 @@ class ScriptExtractor:
                 call_str = " ".join(match.group(0).split())[:MAX_CALL_CHARS]
                 if call_str:
                     calls.append(call_str)
+        if tree is not None:
+            # A regex cannot tell a call from a mention in a docstring or
+            # comment; the AST can. Keep eval/exec/compile only when called.
+            real_calls = _python_dynamic_calls(tree)
+            calls = [
+                call for call in calls
+                if (match := _PY_DYNAMIC_CALL_RE.fullmatch(call)) is None or match.group(1) in real_calls
+            ]
         result["suspicious_calls"] = _unique(calls)
 
         # ── Encoded blob detection ──
@@ -258,11 +289,10 @@ class ScriptExtractor:
 
         return result
 
-    def _extract_python_imports(self, source: str) -> List[str]:
+    def _extract_python_imports(self, source: str, tree: Optional[ast.AST]) -> List[str]:
         """Use Python's AST to reliably extract import statements."""
         imports = []
-        try:
-            tree = ast.parse(source)
+        if tree is not None:
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
@@ -271,7 +301,7 @@ class ScriptExtractor:
                     module = node.module or ""
                     for alias in node.names:
                         imports.append(f"{module}.{alias.name}")
-        except (SyntaxError, ValueError, RecursionError, MemoryError):
+        else:
             # Fallback: regex-based extraction for obfuscated/invalid Python
             for match in _PY_IMPORT_FALLBACK_RE.finditer(source):
                 from_mod = match.group(1) or ""

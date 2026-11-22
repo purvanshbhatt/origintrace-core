@@ -8,6 +8,7 @@ then dispatches to the appropriate specialized extractor:
   ELF (\\x7fELF)       → ELFExtractor + r2ghidra
   Script / plain text → ScriptExtractor (AST + regex + entropy)
   Office document     → MacroExtractor (oletools VBA extraction)
+  Package / archive   → ArchiveExtractor (wheel, sdist, npm tarball, zip, tar)
 
 All extractors produce a normalized dict that maps to the ExtractionResult
 Pydantic schema before being passed to the analysis agents.
@@ -26,6 +27,7 @@ import threading
 import zipfile
 from typing import Dict, Any, List, Optional
 
+from extractors.archive_extractor import ArchiveExtractor
 from extractors.elf_extractor import ELFExtractor
 from extractors.ioc import is_ioc, scan_file_for_iocs
 from extractors.r2util import current_seek, open_r2, r2_available
@@ -146,9 +148,15 @@ def _classify_by_header(file_path: str, head: bytes) -> Optional[str]:
     # OLE Compound Document (legacy Office)
     if head[:4] == b'\xd0\xcf\x11\xe0':
         return "document"
-    # OOXML (ZIP-based Office). A plain ZIP is not a document.
-    if head[:4] == b'PK\x03\x04' and _is_ooxml(file_path):
-        return "document"
+    # ZIP container: OOXML is an Office document, anything else is a package.
+    if head[:2] == b'PK':
+        if _is_ooxml(file_path):
+            return "document"
+        if zipfile.is_zipfile(file_path):
+            return "archive"
+    # gzip / bzip2 / xz streams and plain tarballs (npm, sdist)
+    if head[:2] == b'\x1f\x8b' or head[:3] == b'BZh' or head[:6] == b'\xfd7zXZ\x00' or head[257:262] == b'ustar':
+        return "archive"
     return None
 
 
@@ -166,7 +174,7 @@ def _load_magic() -> Optional[Any]:
 def detect_file_type(file_path: str, filename: str) -> str:
     """
     Detect file type from magic bytes, then libmagic, extension, and content.
-    Returns one of: 'pe', 'elf', 'script', 'document', 'unknown'.
+    Returns one of: 'pe', 'elf', 'script', 'document', 'archive', 'unknown'.
     """
     try:
         with open(file_path, "rb") as f:
@@ -256,6 +264,7 @@ class MasterBinaryExtractor:
         self.elf_extractor = ELFExtractor()
         self.script_extractor = ScriptExtractor()
         self.macro_extractor = MacroExtractor()
+        self.archive_extractor = ArchiveExtractor(self._analyze_member)
 
     @property
     def provenance_engine(self) -> Optional[Any]:
@@ -303,6 +312,7 @@ class MasterBinaryExtractor:
             "binary_features": None,
             "script_features": None,
             "document_features": None,
+            "archive_features": None,
             "provenance": {
                 "ecosystem_match": "None",
                 "legitimate_baseline": [],
@@ -339,6 +349,12 @@ class MasterBinaryExtractor:
                 result["document_features"] = features
                 all_strings = features.get("high_value_strings", [])
 
+            elif file_type == "archive":
+                features = self.archive_extractor.extract(file_path, filename)
+                result["archive_features"] = features
+                all_imports = features.get("imports", [])
+                all_strings = features.get("high_value_strings", [])
+
             else:
                 # Unknown binary format — fall back to raw string extraction
                 result["status"] = "warning: unknown file type, limited analysis performed"
@@ -359,9 +375,29 @@ class MasterBinaryExtractor:
 
         return result
 
+    # ── Archive members ────────────────────────────────────────
+
+    def _analyze_member(self, file_path: str, filename: str) -> Dict[str, Any]:
+        """
+        Analyse one file extracted from an archive. Provenance is skipped (it
+        runs once for the whole archive) and nested archives are not recursed.
+        """
+        file_type = detect_file_type(file_path, filename)
+        features: Optional[Dict[str, Any]] = None
+        if file_type == "pe":
+            # Concolic execution is too slow to run per archive member.
+            features = self._extract_pe(file_path, filename, concolic=False)
+        elif file_type == "elf":
+            features = self.elf_extractor.extract(file_path, filename)
+        elif file_type == "script":
+            features = self.script_extractor.extract(file_path, filename)
+        elif file_type == "document":
+            features = self.macro_extractor.extract(file_path, filename)
+        return {"file_type": file_type, "features": features}
+
     # ── PE Extraction (existing pipeline) ──────────────────────
 
-    def _extract_pe(self, file_path: str, filename: str) -> Dict[str, Any]:
+    def _extract_pe(self, file_path: str, filename: str, concolic: bool = True) -> Dict[str, Any]:
         """Full PE extraction: pefile + r2ghidra + concolic execution."""
         features = {
             "imports": [],
@@ -414,7 +450,7 @@ class MasterBinaryExtractor:
                 logger.warning(f"[PEExtractor] string scan failed: {e}")
 
         # ── Concolic Execution ──
-        if concolic_targets:
+        if concolic and concolic_targets:
             try:
                 resolve_fn = _get_resolve_with_timeout()
                 for target in concolic_targets[:MAX_CONCOLIC_TARGETS]:

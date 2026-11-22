@@ -48,6 +48,8 @@ cd frontend && npm install && npm run dev
 
 Open `http://localhost:5173/app` for the Investigation Workbench (`/classic` keeps the single-page dashboard).
 
+Accepted uploads: packages (PyPI wheels and sdists, npm tarballs, zip, tar), PE and ELF binaries, scripts (Python, JavaScript, shell, PowerShell, batch) and Office documents, up to 32 MB. Packages are unpacked in memory with strict limits; install hooks are analysed first.
+
 ### Pipeline modes
 
 | Mode | When | Analysis and rules come from |

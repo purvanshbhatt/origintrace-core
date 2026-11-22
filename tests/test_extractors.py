@@ -1,12 +1,15 @@
 """Tests for the file-type router and the specialised extractors."""
 import hashlib
+import io
+import tempfile
 import time
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from conftest import BENIGN_PYTHON, MALICIOUS_PYTHON, REVERSE_SHELL
+from conftest import BENIGN_PYTHON, MALICIOUS_PYTHON, REVERSE_SHELL, make_npm_tarball, make_wheel
+from extractors import archive_extractor
 from extractors.extractor import MasterBinaryExtractor, detect_file_type, get_capabilities
 from extractors.ioc import find_iocs, iter_printable_strings
 from extractors.macro_extractor import MacroExtractor, scan_macro_source
@@ -148,6 +151,116 @@ def test_duplicate_long_blobs_are_reported_once(write_sample) -> None:
     path = write_sample("blob.py", f'a = "{blob}"\nb = "{blob}"\n')
     result = ScriptExtractor().extract(str(path), "blob.py")
     assert len(result["encoded_blobs"]) == 1
+
+
+def test_python_mentions_in_text_are_not_calls(write_sample) -> None:
+    source = (
+        '"""Never call eval() or exec() on user input; compile() is fine."""\n'
+        "import re\n"
+        'PATTERN = re.compile("x")\n'
+    )
+    path = write_sample("doc.py", source)
+    assert ScriptExtractor().extract(str(path), "doc.py")["suspicious_calls"] == []
+
+
+def test_python_real_dynamic_calls_are_kept(write_sample) -> None:
+    path = write_sample("dyn.py", 'exec(open("x").read())\nvalue = eval("1 + 1")\n')
+    calls = ScriptExtractor().extract(str(path), "dyn.py")["suspicious_calls"]
+    assert "exec(" in calls
+    assert "eval(" in calls
+
+
+# ── Archives and packages ────────────────────────────────────
+
+def _archive(path: Path) -> dict:
+    result = MasterBinaryExtractor().extract_all(str(path), path.name)
+    assert result["file_type"] == "archive"
+    ExtractionResult.model_validate(result)
+    return result["archive_features"]
+
+
+def test_archives_are_detected(tmp_path: Path) -> None:
+    assert detect_file_type(str(make_wheel(tmp_path / "pkg.whl")), "pkg.whl") == "archive"
+    assert detect_file_type(str(make_npm_tarball(tmp_path / "pkg.tgz")), "pkg.tgz") == "archive"
+
+
+def test_wheel_members_are_analyzed(tmp_path: Path) -> None:
+    archive = _archive(make_wheel(tmp_path / "totally_legit-1.0-py3-none-any.whl"))
+
+    assert archive["archive_type"] == "wheel"
+    assert archive["member_count"] == 4
+    assert archive["package"] == {"ecosystem": "PyPI", "name": "totally-legit", "version": "1.0"}
+    init = next(m for m in archive["analyzed_members"] if m["path"] == "totally_legit/__init__.py")
+    assert init["language"] == "python"
+    assert "exec(" in init["suspicious_calls"]
+    assert "http://185.220.101.7/drop/stage2.bin" in archive["high_value_strings"]
+
+
+def test_npm_tarball_reports_install_hooks(tmp_path: Path) -> None:
+    archive = _archive(make_npm_tarball(tmp_path / "colors-js-1.4.1.tgz"))
+
+    assert archive["archive_type"] == "npm"
+    assert archive["package"] == {"ecosystem": "npm", "name": "colors-js", "version": "1.4.1"}
+    assert archive["install_hooks"] == ["postinstall: node install.js"]
+    # The script an install hook runs is analysed ahead of ordinary sources.
+    assert archive["analyzed_members"][0]["path"] == "package/install.js"
+    assert "child_process" in archive["analyzed_members"][0]["suspicious_calls"]
+
+
+def test_archive_member_limit_is_enforced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(archive_extractor, "MAX_MEMBERS_ANALYZED", 5)
+    path = tmp_path / "many.zip"
+    with zipfile.ZipFile(path, "w") as zf:
+        for i in range(20):
+            zf.writestr(f"src/mod{i}.py", "import os\n")
+
+    archive = _archive(path)
+
+    assert len(archive["analyzed_members"]) == 5
+    assert any("15" in note for note in archive["notes"])
+
+
+def test_oversized_and_nested_members_are_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(archive_extractor, "MAX_MEMBER_BYTES", 64)
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as zf:
+        zf.writestr("a.py", "x = 1\n")
+    path = tmp_path / "mixed.zip"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("big.py", "x = 1\n" * 100)
+        zf.writestr("inner.zip", inner.getvalue())
+        zf.writestr("ok.py", "y = 2\n")
+
+    archive = _archive(path)
+
+    assert [m["path"] for m in archive["analyzed_members"]] == ["ok.py"]
+    notes = " | ".join(archive["notes"])
+    assert "big.py" in notes
+    assert "inner.zip" in notes
+
+
+def test_traversal_member_names_never_touch_the_filesystem(tmp_path: Path) -> None:
+    workdir = tmp_path / "a" / "b"
+    workdir.mkdir(parents=True)
+    path = workdir / "evil.zip"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("../../escaped.py", MALICIOUS_PYTHON)
+
+    archive = _archive(path)
+
+    assert not list(tmp_path.rglob("escaped.py"))
+    assert len(archive["analyzed_members"]) == 1
+    assert any("traversal" in note for note in archive["notes"])
+
+
+def test_archive_member_temp_files_are_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    _archive(make_wheel(tmp_path / "pkg.whl"))
+
+    assert list(scratch.iterdir()) == []
 
 
 # ── File-type router ─────────────────────────────────────────

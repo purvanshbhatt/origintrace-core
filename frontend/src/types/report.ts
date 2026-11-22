@@ -80,6 +80,42 @@ export interface DocumentFeatures {
   high_value_strings: string[];
 }
 
+export interface ArchiveMember {
+  path: string;
+  size: number;
+  sha256: string;
+  file_type: string;
+  language?: string | null;
+  imports: string[];
+  suspicious_calls: string[];
+  high_value_strings: string[];
+  encoded_blobs: string[];
+  obfuscation_score: number;
+  has_macros: boolean;
+  source_excerpt: string;
+}
+
+export interface PackageIdentity {
+  ecosystem: string;
+  name: string;
+  version: string;
+}
+
+export interface ArchiveFeatures {
+  /** wheel, sdist, npm, zip, tar, gzip */
+  archive_type: string;
+  member_count: number;
+  total_uncompressed_bytes: number;
+  /** Self-declared by the package metadata; not verified. */
+  package: PackageIdentity | null;
+  install_hooks: string[];
+  analyzed_members: ArchiveMember[];
+  notes: string[];
+  imports: string[];
+  suspicious_calls: string[];
+  high_value_strings: string[];
+}
+
 export interface Provenance {
   ecosystem_match: string;
   legitimate_baseline: string[];
@@ -93,6 +129,7 @@ export interface ExtractionResult {
   binary_features: BinaryFeatures | null;
   script_features: ScriptFeatures | null;
   document_features: DocumentFeatures | null;
+  archive_features?: ArchiveFeatures | null;
   provenance: Provenance;
   status: string;
 }

@@ -68,7 +68,15 @@ data: {"type": "error", "message": "Extraction timed out after 120s."}`}
               <Book className="w-6 h-6 text-cyan-400" />
               <h2 className="text-2xl font-bold text-white">Supported Formats</h2>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="p-4 border border-gray-800 rounded-lg bg-gray-900/30">
+                <h4 className="font-bold text-white mb-2">Packages</h4>
+                <ul className="list-disc pl-5 text-sm text-gray-400 space-y-1">
+                  <li>PyPI wheels and sdists (.whl, .tar.gz)</li>
+                  <li>npm tarballs (.tgz), with install-hook detection</li>
+                  <li>Plain ZIP and TAR archives</li>
+                </ul>
+              </div>
               <div className="p-4 border border-gray-800 rounded-lg bg-gray-900/30">
                 <h4 className="font-bold text-white mb-2">Native Binaries</h4>
                 <ul className="list-disc pl-5 text-sm text-gray-400 space-y-1">
@@ -93,7 +101,7 @@ data: {"type": "error", "message": "Extraction timed out after 120s."}`}
               </div>
             </div>
             <p className="mt-4 text-sm text-gray-500">
-              Package archives (.whl, .tgz, .zip) are not unpacked yet: extract the suspect file and upload it directly.
+              Packages are unpacked in memory with strict limits: up to 40 files are analysed (install hooks first, 8 MB per file), nested archives are reported but not opened, and member paths are never written to disk.
             </p>
           </section>
 

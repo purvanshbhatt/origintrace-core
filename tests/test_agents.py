@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,7 +15,7 @@ from agents.heuristic import (
     build_sigma_rule,
     build_yara_rule,
 )
-from conftest import BENIGN_PYTHON, MALICIOUS_PYTHON, REVERSE_SHELL
+from conftest import BENIGN_PYTHON, MALICIOUS_PYTHON, REVERSE_SHELL, make_npm_tarball, make_wheel
 from extractors.extractor import MasterBinaryExtractor
 from models import AnalystReport, DetectionArtifacts
 
@@ -163,6 +164,49 @@ def test_build_llm_context_trims_without_mutating() -> None:
     assert len(trimmed["binary_features"]["high_value_strings"]) <= 150
     assert len(trimmed["binary_features"]["functions"][0]["decompiled_c"]) <= 4100
     assert len(trimmed["provenance"]["injected_artifacts"]) <= 150
+
+
+def test_mentions_in_docstrings_do_not_raise_severity(write_sample) -> None:
+    source = '"""Never call eval() or exec() on user input."""\nimport re\nPATTERN = re.compile("x")\n'
+    report = _analyze(_features(write_sample, "doc.py", source))
+    assert report.mitre_mapping == []
+    assert report.threat_level == "Low"
+
+
+def test_malicious_wheel_is_attributed_to_its_package(tmp_path: Path) -> None:
+    path = make_wheel(tmp_path / "totally_legit-1.0-py3-none-any.whl")
+    report = _analyze(MasterBinaryExtractor().extract_all(str(path), path.name))
+
+    assert report.threat_level == "High"
+    assert {"T1059.006", "T1105", "T1140"} <= _technique_ids(report)
+    assert report.attribution.ecosystem == "PyPI"
+    assert report.attribution.suspected_package == "totally-legit"
+    # Evidence names the member it came from.
+    assert any("totally_legit/__init__.py" in t.evidence for t in report.mitre_mapping)
+    assert "totally-legit" in report.provenance_explanation
+
+
+def test_npm_install_hook_is_flagged(tmp_path: Path) -> None:
+    path = make_npm_tarball(tmp_path / "colors-js-1.4.1.tgz")
+    report = _analyze(MasterBinaryExtractor().extract_all(str(path), path.name))
+
+    assert {"T1195.002", "T1059.007", "T1105"} <= _technique_ids(report)
+    supply_chain = next(t for t in report.mitre_mapping if t.technique_id == "T1195.002")
+    assert "postinstall" in supply_chain.evidence
+    assert report.attribution.suspected_package == "colors-js"
+
+
+def test_archive_yara_rule_targets_unpacked_contents(tmp_path: Path) -> None:
+    path = make_wheel(tmp_path / "pkg.whl")
+    features = MasterBinaryExtractor().extract_all(str(path), path.name)
+    rules = _rules(features, _analyze(features))
+
+    # The strings live inside the compressed archive, so the rule must not
+    # carry container-level guards and must say what to scan.
+    assert "uint16(0)" not in rules.yara_rule
+    assert "filesize <" not in rules.yara_rule
+    assert "unpacked" in rules.yara_rule
+    assert "http://185.220.101.7/drop/stage2.bin" in rules.yara_rule
 
 
 # ── Heuristic detection engineer ─────────────────────────────

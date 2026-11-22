@@ -203,9 +203,17 @@ def _extraction_summary(features: Dict[str, Any]) -> str:
     """One-line progress message describing what extraction found."""
     file_type = features.get("file_type", "unknown")
     indicators = 0
-    for key in ("binary_features", "script_features", "document_features"):
+    for key in ("binary_features", "script_features", "document_features", "archive_features"):
         payload = features.get(key) or {}
         indicators += len(payload.get("high_value_strings") or [])
+
+    archive = features.get("archive_features")
+    if archive:
+        analyzed = len(archive.get("analyzed_members") or [])
+        return (
+            f"Classified as {archive.get('archive_type', 'archive')} package; {analyzed} of "
+            f"{archive.get('member_count', 0)} member(s) analysed, {indicators} indicator(s) extracted."
+        )
     return f"Classified as {file_type}; {indicators} indicator(s) extracted."
 
 

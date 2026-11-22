@@ -17,13 +17,13 @@ indicator that triggered it, and a clean result is never reported as "safe".
 import os
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Sequence, Tuple
 
 from agents.context import attribution_from_provenance, level_from_score
 from extractors.ioc import IPV4_RE, REGISTRY_RE, UNIX_PATH_RE, URL_RE, WINDOWS_PATH_RE
-from models import AnalystReport, DetectionArtifacts, MitreTechnique
+from models import AnalystReport, Attribution, DetectionArtifacts, MitreTechnique
 
 ENGINE_NAME = "heuristic"
 
@@ -90,10 +90,66 @@ class IndicatorView:
     has_macros: bool
     extension_mismatch: bool
     provenance: Dict[str, Any]
+    # Archives only: package identity, install hooks, and one view per member.
+    package: Dict[str, str] = field(default_factory=dict)
+    install_hooks: List[str] = field(default_factory=list)
+    archive_type: str = ""
+    members: List["IndicatorView"] = field(default_factory=list)
+
+    @classmethod
+    def _from_member(cls, member: Dict[str, Any]) -> "IndicatorView":
+        """View of one analysed archive member."""
+        return cls(
+            filename=str(member.get("path") or "member"),
+            file_type=str(member.get("file_type") or "unknown"),
+            language=str(member.get("language") or ""),
+            imports=_strings(member, "imports"),
+            strings=_strings(member, "high_value_strings"),
+            calls=_strings(member, "suspicious_calls"),
+            source=str(member.get("source_excerpt") or ""),
+            blobs=_strings(member, "encoded_blobs"),
+            resolved_strings=[],
+            max_section_entropy=0.0,
+            script_entropy=float(member.get("obfuscation_score") or 0.0),
+            has_macros=bool(member.get("has_macros")),
+            extension_mismatch=False,
+            provenance={},
+        )
+
+    @classmethod
+    def _from_archive(cls, features: Dict[str, Any], archive: Dict[str, Any]) -> "IndicatorView":
+        """Aggregate view of a package, with a member view per analysed file."""
+        metadata = features.get("metadata") or {}
+        members = [cls._from_member(m) for m in (archive.get("analyzed_members") or []) if isinstance(m, dict)]
+        package = archive.get("package")
+        return cls(
+            filename=str(metadata.get("filename") or "sample"),
+            file_type="archive",
+            language="",
+            imports=_strings(archive, "imports"),
+            strings=_strings(archive, "high_value_strings"),
+            calls=_strings(archive, "suspicious_calls"),
+            source="",
+            blobs=_unique(blob for member in members for blob in member.blobs),
+            resolved_strings=[],
+            max_section_entropy=0.0,
+            script_entropy=0.0,
+            has_macros=any(member.has_macros for member in members),
+            extension_mismatch=bool(metadata.get("extension_mismatch")),
+            provenance=features.get("provenance") or {},
+            package={str(k): str(v) for k, v in package.items()} if isinstance(package, dict) else {},
+            install_hooks=_strings(archive, "install_hooks"),
+            archive_type=str(archive.get("archive_type") or ""),
+            members=members,
+        )
 
     @classmethod
     def from_features(cls, features: Dict[str, Any]) -> "IndicatorView":
         features = features or {}
+        archive = features.get("archive_features")
+        if isinstance(archive, dict):
+            return cls._from_archive(features, archive)
+
         metadata = features.get("metadata") or {}
         binary = features.get("binary_features") or {}
         script = features.get("script_features") or {}
@@ -125,17 +181,34 @@ class IndicatorView:
             provenance=features.get("provenance") or {},
         )
 
-    def first_hit(self, pattern: Pattern[str]) -> Optional[str]:
-        """Describe the first place ``pattern`` matches, most specific first."""
+    def _source_line(self, pattern: Pattern[str]) -> Optional[str]:
+        match = pattern.search(self.source)
+        if not match:
+            return None
+        start = self.source.rfind("\n", 0, match.start()) + 1
+        end = self.source.find("\n", match.end())
+        return _clip(self.source[start: end if end != -1 else len(self.source)])
+
+    def first_hit(self, pattern: Pattern[str], calls_only: bool = False) -> Optional[str]:
+        """
+        Describe the first place ``pattern`` matches, most specific first.
+
+        With ``calls_only`` the pattern must match a call the extractor
+        confirmed; the source is then used only to show the line.
+        """
+        if calls_only:
+            for item in self.calls:
+                if pattern.search(item):
+                    line = self._source_line(pattern)
+                    return f"source: {line}" if line else f"call: {_clip(item)}"
+            return None
+
         for item in self.imports:
             if pattern.search(item):
                 return f"import: {_clip(item)}"
-        match = pattern.search(self.source)
-        if match:
-            start = self.source.rfind("\n", 0, match.start()) + 1
-            end = self.source.find("\n", match.end())
-            line = self.source[start: end if end != -1 else len(self.source)]
-            return f"source: {_clip(line)}"
+        line = self._source_line(pattern)
+        if line:
+            return f"source: {line}"
         for label, bucket in (("call", self.calls), ("string", self.strings)):
             for item in bucket:
                 if pattern.search(item):
@@ -157,6 +230,10 @@ class Rule:
     file_types: Optional[Tuple[str, ...]] = None
     languages: Optional[Tuple[str, ...]] = None
     predicate: Optional[Callable[[IndicatorView], Optional[str]]] = None
+    # Match only calls the extractor confirmed (not text that merely mentions them).
+    calls_only: bool = False
+    # Needs whole-sample context; for an archive it runs once, not per member.
+    top_level: bool = False
 
     def evaluate(self, view: IndicatorView) -> Optional[str]:
         """Return an evidence string when the rule fires, else None."""
@@ -171,7 +248,7 @@ class Rule:
             if note:
                 evidence.append(note)
 
-        hits = [hit for hit in (view.first_hit(pattern) for pattern in self.patterns) if hit]
+        hits = [hit for hit in (view.first_hit(pattern, self.calls_only) for pattern in self.patterns) if hit]
         if len(hits) >= self.min_matches:
             evidence.extend(hits)
 
@@ -232,19 +309,37 @@ def _masquerade(view: IndicatorView) -> Optional[str]:
 
 
 def _supply_chain(view: IndicatorView) -> Optional[str]:
+    notes = []
     attribution = attribution_from_provenance(view.provenance)
     injected = view.provenance.get("injected_artifacts") or []
-    if not attribution.suspected_package or not injected:
-        return None
-    return (
-        f"features resemble {attribution.suspected_package} ({attribution.ecosystem}) "
-        f"with {len(injected)} artifact(s) outside its baseline"
-    )
+    if attribution.suspected_package and injected:
+        notes.append(
+            f"features resemble {attribution.suspected_package} ({attribution.ecosystem}) "
+            f"with {len(injected)} artifact(s) outside its baseline"
+        )
+    # An install hook alone is normal (native builds); one that ships next to
+    # suspicious code or network indicators is how hijacked packages execute.
+    network = [s for s in view.strings if URL_RE.match(s) or IPV4_RE.fullmatch(s)]
+    if view.install_hooks and (view.calls or network):
+        notes.append(
+            f"install hook '{_clip(view.install_hooks[0], 60)}' runs at install time and the package "
+            f"contains {len(view.calls)} suspicious call(s) and {len(network)} network indicator(s)"
+        )
+    return "; ".join(notes) or None
+
+
+def attribution_for(view: IndicatorView) -> Attribution:
+    """Provenance match if there is one, else the archive's own package identity."""
+    attribution = attribution_from_provenance(view.provenance)
+    if attribution.suspected_package or not view.package.get("name"):
+        return attribution
+    return Attribution(ecosystem=view.package.get("ecosystem") or "Unknown", suspected_package=view.package["name"])
 
 
 RULES: Tuple[Rule, ...] = (
     # ── Initial Access ──
-    Rule("T1195.002", "Compromise Software Supply Chain", "Initial Access", 25, predicate=_supply_chain),
+    Rule("T1195.002", "Compromise Software Supply Chain", "Initial Access", 25, predicate=_supply_chain,
+         top_level=True),
     # ── Execution ──
     Rule("T1204.002", "User Execution: Malicious File", "Execution", 25, predicate=_autoexec_macro),
     Rule("T1059.001", "PowerShell", "Execution", 20, _p(
@@ -256,9 +351,10 @@ RULES: Tuple[Rule, ...] = (
     Rule("T1059.005", "Visual Basic", "Execution", 20, predicate=_has_macros),
     Rule("T1059.006", "Python", "Execution", 20, _p(
         r"(?<![\w.])exec\s*\(", r"(?<![\w.])eval\s*\(", r"(?<![\w.])compile\s*\(",
-        r"\b__import__\s*\(", r"\bmarshal\.loads\b"), languages=("python",)),
+        r"\b__import__\s*\(", r"\bmarshal\.loads\b"), languages=("python",), calls_only=True),
     Rule("T1059.007", "JavaScript", "Execution", 20, _p(
-        r"(?<![\w.])eval\s*\(", r"\bFunction\s*\(", r"\bchild_process\b"), languages=("javascript",)),
+        r"(?<![\w.])eval\s*\(", r"\bFunction\s*\(", r"\bchild_process\b"), languages=("javascript",),
+         calls_only=True),
     Rule("T1106", "Native API", "Execution", 10, _p(
         r"\bVirtualAlloc\b", r"\bVirtualProtect\b", r"\bCreateProcess[AW]?\b", r"\bWinExec\b",
         r"\bShellExecute(?:Ex)?[AW]?\b", r"\bctypes\.(?:windll|cdll|CDLL)\b")),
@@ -280,7 +376,7 @@ RULES: Tuple[Rule, ...] = (
         r"\bb64decode\b", r"\bbase64\s+(?:-d|--decode)\b", r"\batob\s*\(", r"\bFromBase64String\b",
         r"Buffer\.from\([^)]*base64", r"\bcertutil\b.*-decode\b", r"\bbytes\.fromhex\b",
         r"\bcodecs\.decode\b", r"\bzlib\.decompress\b", r"\bunhexlify\b"), predicate=_resolved_strings),
-    Rule("T1036.008", "Masquerade File Type", "Defense Evasion", 15, predicate=_masquerade),
+    Rule("T1036.008", "Masquerade File Type", "Defense Evasion", 15, predicate=_masquerade, top_level=True),
     Rule("T1562.001", "Disable or Modify Tools", "Defense Evasion", 20, _p(
         r"(?:Add|Set)-MpPreference", r"DisableRealtimeMonitoring", r"setenforce\s+0")),
     Rule("T1562.004", "Disable or Modify System Firewall", "Defense Evasion", 15, _p(
@@ -324,10 +420,23 @@ RULES: Tuple[Rule, ...] = (
 
 # ─── Analyst ─────────────────────────────────────────────────
 
-def _provenance_explanation(provenance: Dict[str, Any]) -> str:
+def _package_statement(view: IndicatorView) -> str:
+    """What the archive's own metadata says it is (unverified, attacker-supplied)."""
+    name = view.package.get("name")
+    if not name:
+        return ""
+    version = view.package.get("version")
+    identity = f"{view.package.get('ecosystem', 'Unknown')} package {name}" + (f" {version}" if version else "")
+    hooks = f" It declares {len(view.install_hooks)} install hook(s)." if view.install_hooks else ""
+    return f"Package metadata identifies this archive as {identity} (self-declared, not verified).{hooks} "
+
+
+def _provenance_explanation(view: IndicatorView) -> str:
+    provenance = view.provenance
     attribution = attribution_from_provenance(provenance)
     match = str(provenance.get("ecosystem_match") or "None")
     injected = [str(item) for item in (provenance.get("injected_artifacts") or [])]
+    package = _package_statement(view)
 
     if attribution.suspected_package:
         sample = ", ".join(_clip(item, 60) for item in injected[:3])
@@ -335,28 +444,47 @@ def _provenance_explanation(provenance: Dict[str, Any]) -> str:
             f" {len(injected)} artifact(s) fall outside that library's known baseline and are treated "
             f"as the injected delta: {sample}." if injected else " No artifacts fall outside its known baseline."
         )
-        return f"The extracted features most closely resemble {match}.{delta}"
+        return f"{package}The extracted features most closely resemble {match}.{delta}"
     if attribution.ecosystem == "Native/Unknown":
         return (
-            f"No known open-source library baseline matched ({match}); all {len(injected)} extracted "
+            f"{package}No known open-source library baseline matched ({match}); all {len(injected)} extracted "
             "artifact(s) are treated as native to this sample."
         )
-    return "No provenance signal: the sample exposed no strings or imports to compare against library baselines."
+    return (
+        f"{package}No provenance signal: the sample exposed no strings or imports to compare against "
+        "library baselines."
+    )
 
 
 def analyze_features(features: Dict[str, Any]) -> AnalystReport:
     """Map an ExtractionResult to ATT&CK techniques using the rule table."""
     view = IndicatorView.from_features(features)
 
-    fired: List[Tuple[Rule, str]] = []
+    # For a package, per-file rules run against each member (so a Python rule
+    # never fires on a JavaScript file) and the evidence names that member.
+    # Each technique is reported once, from the first member that shows it.
+    matched: Dict[str, Tuple[Rule, str]] = {}
+    is_archive = view.file_type == "archive"
+    for target in (view.members if is_archive else [view]):
+        prefix = f"{target.filename}: " if is_archive else ""
+        for rule in RULES:
+            if rule.top_level or rule.technique_id in matched:
+                continue
+            evidence = rule.evaluate(target)
+            if evidence:
+                matched[rule.technique_id] = (rule, prefix + evidence)
     for rule in RULES:
-        evidence = rule.evaluate(view)
-        if evidence:
-            fired.append((rule, evidence))
+        if rule.top_level and rule.technique_id not in matched:
+            evidence = rule.evaluate(view)
+            if evidence:
+                matched[rule.technique_id] = (rule, evidence)
 
-    fired.sort(key=lambda item: (TACTIC_ORDER.index(item[0].tactic), -item[0].weight))
+    fired = sorted(matched.values(), key=lambda item: (TACTIC_ORDER.index(item[0].tactic), -item[0].weight))
     score = min(100, sum(rule.weight for rule, _ in fired))
-    kind = view.file_type + (f"/{view.language}" if view.language not in ("", "unknown") else "")
+    if is_archive:
+        kind = f"archive/{view.archive_type or 'unknown'}, {len(view.members)} file(s) analysed"
+    else:
+        kind = view.file_type + (f"/{view.language}" if view.language not in ("", "unknown") else "")
 
     if fired:
         tactics = _unique(rule.tactic for rule, _ in fired)
@@ -384,8 +512,8 @@ def analyze_features(features: Dict[str, Any]) -> AnalystReport:
                            technique_name=rule.name, evidence=evidence)
             for rule, evidence in fired
         ],
-        provenance_explanation=_provenance_explanation(view.provenance),
-        attribution=attribution_from_provenance(view.provenance),
+        provenance_explanation=_provenance_explanation(view),
+        attribution=attribution_for(view),
         engine=ENGINE_NAME,
     )
 
@@ -476,6 +604,9 @@ def build_yara_rule(filename: str, sha256: str, file_type: str, size: int,
         f'hash = "{sha256 or "unknown"}"',
         f'threat_level = "{_yara_escape(threat_level)}"',
     ]
+    if file_type == "archive" and (strong or weak_all):
+        # The strings are compressed inside the archive: scan what it unpacks to.
+        meta.append('scan_target = "unpacked package contents, not the archive file"')
     meta_block = "\n".join(f"        {line}" for line in meta)
 
     if not strong and not weak_all:
@@ -505,7 +636,9 @@ def build_yara_rule(filename: str, sha256: str, file_type: str, size: int,
         guards.append("uint16(0) == 0x5A4D")
     elif file_type == "elf":
         guards.append("uint32(0) == 0x464C457F")
-    guards.append(f"filesize < {max(int(size or 0) * 4, 1024 * 1024)}")
+    if file_type != "archive":
+        # An archive's own size says nothing about the files it unpacks to.
+        guards.append(f"filesize < {max(int(size or 0) * 4, 1024 * 1024)}")
     condition = " and ".join(guards + [match_clause])
 
     strings_block = "\n".join(string_lines)

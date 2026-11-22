@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 import main
 from agents.heuristic import HeuristicAnalystAgent, HeuristicDetectionEngineerAgent
-from conftest import BENIGN_PYTHON, MALICIOUS_PYTHON
+from conftest import BENIGN_PYTHON, MALICIOUS_PYTHON, make_wheel
 from extractors.extractor import MasterBinaryExtractor
 from models import FinalReport
 
@@ -109,6 +109,20 @@ def test_mock_pipeline_uses_real_hashes_and_shared_contract(mock_client: TestCli
     assert report["features"]["metadata"]["sha256"] == hashlib.sha256(content).hexdigest()
     assert report["features"]["metadata"]["size"] == len(content)
     assert report["intelligence"]["engine"] == "mock"
+
+
+def test_package_upload_is_unpacked_and_attributed(heuristic_client: TestClient, tmp_path: Path) -> None:
+    content = make_wheel(tmp_path / "pkg.whl").read_bytes()
+    events = _events(_upload(heuristic_client, "totally_legit-1.0-py3-none-any.whl", content))
+
+    assert events[-1]["type"] == "complete"
+    report = events[-1]["data"]
+    FinalReport.model_validate(report)
+    assert report["features"]["file_type"] == "archive"
+    assert report["features"]["archive_features"]["package"]["name"] == "totally-legit"
+    assert report["intelligence"]["threat_level"] == "High"
+    assert report["intelligence"]["attribution"]["suspected_package"] == "totally-legit"
+    assert any("member" in e["message"] for e in events if e["type"] == "status")
 
 
 def test_large_complete_event_is_a_single_sse_line(heuristic_client: TestClient) -> None:
